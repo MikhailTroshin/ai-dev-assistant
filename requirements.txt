@@ -1,0 +1,17 @@
+# Telegram bot
+aiogram==3.20.0
+
+# Queue and Redis
+arq==0.28.0
+redis==5.2.1
+
+# Database
+sqlalchemy==2.0.36
+aiosqlite==0.20.0
+
+# Environment
+python-dotenv==1.0.1
+
+# Utils
+pydantic==2.10.3
+pydantic-settings==2.7.0
