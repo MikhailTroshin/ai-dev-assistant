@@ -3,5 +3,5 @@
 # Активируем виртуальное окружение
 source .venv/bin/activate
 
-# Запускаем worker
-arq src.worker.worker.WorkerSettings
+# Запускаем бота
+python -m src.bot.main

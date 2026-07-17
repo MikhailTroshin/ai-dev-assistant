@@ -31,11 +31,9 @@ async def process_task(
     
     start_time = datetime.now()
     
-    # Определяем рабочую директорию
     work_dir = Path(working_dir) if working_dir else settings.ML_REPO_PATH
     logger.info(f"Используем директорию: {work_dir}")
     
-    # Запускаем Claude Code
     logger.info("Запускаем Claude Code...")
     result = await claude_runner.run(
         prompt=prompt,
@@ -45,7 +43,6 @@ async def process_task(
     end_time = datetime.now()
     duration = (end_time - start_time).total_seconds()
     
-    # Добавляем метаданные
     result.update({
         "task_id": task_id,
         "duration_seconds": duration,
@@ -57,6 +54,16 @@ async def process_task(
     logger.info(f"Success: {result['success']}")
     
     return result
+
+
+# Функции для lifecycle - обычные async функции, НЕ staticmethod
+async def startup(ctx):
+    logger.info("🟢 Worker запущен")
+    logger.info(f"Redis: {settings.REDIS_HOST}:{settings.REDIS_PORT}")
+
+
+async def shutdown(ctx):
+    logger.info("🔴 Worker остановлен")
 
 
 class WorkerSettings:
@@ -73,14 +80,9 @@ class WorkerSettings:
     max_jobs = 1
     job_timeout = 300
     
-    @staticmethod
-    async def on_startup(ctx):
-        logger.info("🟢 Worker запущен")
-        logger.info(f"Redis: {settings.REDIS_HOST}:{settings.REDIS_PORT}")
-    
-    @staticmethod
-    async def on_shutdown(ctx):
-        logger.info("🔴 Worker остановлен")
+    # Ссылаемся на функции модуля
+    on_startup = startup
+    on_shutdown = shutdown
 
 
 async def main():
@@ -92,7 +94,7 @@ async def main():
     task = await redis.enqueue_job(
         'process_task',
         task_id="test-001",
-        prompt="Кратко опиши структуру текещего репозитория",
+        prompt="Объясни структуру проекта в текущей директории",
         working_dir=str(settings.ML_REPO_PATH)
     )
     
@@ -101,9 +103,11 @@ async def main():
     
     try:
         result = await task.result(timeout=120)
-        logger.info(f"\n✅ Результат получен: {result}")
+        logger.info(f"Результат получен: {result}")
+        print(f"\n✅ Результат:\n{result}")
     except asyncio.TimeoutError:
         logger.error("❌ Таймаут ожидания результата")
+        print("❌ Таймаут - задача не выполнилась")
         raise
 
 

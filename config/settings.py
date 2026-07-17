@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     LOG_FILE: Path = Path("logs/assistant.log")
     
+    # Telegram
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_ADMIN_ID: int = 0
+    
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
