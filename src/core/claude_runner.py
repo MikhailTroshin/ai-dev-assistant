@@ -3,44 +3,33 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+from config.settings import settings
+
 logger = logging.getLogger(__name__)
 
 
 class ClaudeRunner:
     """Обёртка для запуска Claude Code через CLI"""
     
-    def __init__(self, claude_path: str = "claude"):
-        self.claude_path = claude_path
+    def __init__(self, claude_path: str = None):
+        self.claude_path = claude_path or settings.CLAUDE_CODE_PATH
     
     async def run(
         self,
         prompt: str,
         working_dir: Optional[Path] = None,
-        timeout: int = 300
+        timeout: Optional[int] = None
     ) -> dict:
         """
         Запускает Claude Code с промптом
-        
-        Args:
-            prompt: Промпт для Claude Code
-            working_dir: Рабочая директория (по умолчанию текущая)
-            timeout: Таймаут в секундах
-            
-        Returns:
-            dict с результатами:
-            {
-                "success": bool,
-                "output": str,
-                "error": str | None
-            }
         """
+        timeout = timeout or settings.CLAUDE_TIMEOUT
+        
         try:
             logger.info(f"Запуск Claude Code с промптом: {prompt[:100]}...")
             
-            # Формируем команду
             cmd = [self.claude_path, prompt]
             
-            # Запускаем процесс
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -48,7 +37,6 @@ class ClaudeRunner:
                 cwd=working_dir
             )
             
-            # Ждём завершения с таймаутом
             try:
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(),
@@ -90,5 +78,4 @@ class ClaudeRunner:
             }
 
 
-# Singleton
 claude_runner = ClaudeRunner()
