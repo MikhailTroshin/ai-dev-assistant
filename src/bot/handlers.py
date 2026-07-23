@@ -229,16 +229,113 @@ async def cmd_status(message: Message, redis_pool):
     await redis_client.close()
     
     text = f"""
-📊 Статус системы:
+        📊 Статус системы:
 
-Redis:
-- Подключений: {redis_info.get('connected_clients', 'N/A')}
-- Используется памяти: {redis_info.get('used_memory_human', 'N/A')}
+        Redis:
+        - Подключений: {redis_info.get('connected_clients', 'N/A')}
+        - Используется памяти: {redis_info.get('used_memory_human', 'N/A')}
 
-Задачи:
-- Ожидают отправки: {pending_count}
+        Задачи:
+        - Ожидают отправки: {pending_count}
 
-Система работает ✅
-"""
+        Система работает ✅
+    """
     await message.answer(text)
+
+
+@router.message(Command("code-review"))
+async def cmd_code_review(message: Message, state: FSMContext, redis_pool, bot):
+    """Обработчик команды /code-review <JIRA_KEY>"""
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("❌ Использование: `/code-review <JIRA_KEY>` (например, `/code-review AA-123`)", parse_mode="Markdown")
+        return
+    
+    jira_key = args[1].strip().upper()
+    task_id = f"review_{message.from_user.id}_{message.message_id}"
+    
+    await message.answer(
+        f"⏳ Задача принята!\n"
+        f"ID: `{task_id}`\n\n"
+        f"Ищу MR по задаче {jira_key} и провожу code review...",
+        parse_mode="Markdown"
+    )
+    
+    prompt = f"""
+        Выполни code review для задачи {jira_key}.
+        1. Используй skill `jira-lookup`, чтобы найти задачу и получить ссылку на GitLab MR.
+        2. Используй skill `gitlab-mr-review` (или MCP gitlab), чтобы получить diff и комментарии к MR.
+        3. Проанализируй изменения. Найди потенциальные баги, проблемы с архитектурой или логикой.
+        4. Верни краткий структурированный отчет на русском языке.
+    """
+    
+    await redis_pool.enqueue_job(
+        'process_task',
+        task_id=task_id,
+        prompt=prompt,
+        working_dir=str(settings.ML_REPO_PATH),
+        chat_id=message.chat.id,
+        user_id=message.from_user.id
+    )
+    
+    # Сохраняем маппинг (код уже есть в предыдущих хендлерах, убедись, что он вызывается)
+    redis_client = redis.from_url(f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}")
+    await redis_client.hset("task_chat_mapping", task_id, json.dumps({"chat_id": message.chat.id, "user_id": message.from_user.id}))
+    await redis_client.close()
+
+
+@router.message(Command("rebase"))
+async def cmd_rebase(message: Message, state: FSMContext, redis_pool, bot):
+    """Обработчик команды /rebase <branch_a> <branch_b>"""
+    args = message.text.split()
+    if len(args) < 3:
+        await message.answer("❌ Использование: `/rebase <исходная_ветка> <целевая_ветка> `\n(например, `/rebase feature-branch master`)", parse_mode="Markdown")
+        return
+    
+    branch_a = args[1].strip() # исходная (которую ребейзим) 
+    branch_b = args[2].strip() # целевая (НА которую перебазируем)
+    task_id = f"rebase_{message.from_user.id}_{message.message_id}"
+    
+    await message.answer(
+        f"⏳ Задача принята!\n"
+        f"ID: `{task_id}`\n\n"
+        f"Выполняю rebase {branch_a} onto {branch_b}. Если будут конфликты, ИИ попробует их разрешить...",
+        parse_mode="Markdown"
+    )
+    
+    prompt = f"""
+    Выполни безопасный git rebase в директории проекта.
+    Целевая ветка: {branch_a}
+    Ветка НА которую будем перебазировать: {branch_b}
+    
+    Строго следуй алгоритму:
+    1. `git fetch --all`
+    2. `git checkout {branch_a}`
+    3. `git checkout -b {branch_a}_backup_{task_id}` (создай бекап ветки!)
+    4. `git checkout {branch_a}`
+    5. `git rebase {branch_b}`
+    6. ЕСЛИ возникли конфликты:
+    - Определи конфликтующие файлы через `git status`.
+    - Прочитай содержимое конфликтующих файлов.
+    - Проанализируй конфликт, проанализируй изменения в обеих ветках и всех коммитах, с которых началось разделение веток
+    - Предложи корректное решение с учетом того, что нужно в приоритете оставить изменения из ветки {branch_a} (применив их поверх ветки {branch_b}), но не потерять важные изменения из ветки {branch_a}.
+    - Внеси исправления в файлы.
+    - Выполни `git add <файлы>` и `git rebase --continue`.
+    - Повторяй, пока rebase не завершится.
+    7. Если rebase успешен, выполни `git push --force-with-lease origin {branch_a}`.
+    8. Сообщай о каждом шаге. Если требуется вмешательство человека (невозможно разрешить автоматически), остановись и четко опиши проблему.
+    """
+    
+    await redis_pool.enqueue_job(
+        'process_task',
+        task_id=task_id,
+        prompt=prompt,
+        working_dir=str(settings.ML_REPO_PATH),
+        chat_id=message.chat.id,
+        user_id=message.from_user.id
+    )
+    
+    redis_client = redis.from_url(f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}")
+    await redis_client.hset("task_chat_mapping", task_id, json.dumps({"chat_id": message.chat.id, "user_id": message.from_user.id}))
+    await redis_client.close()
     
