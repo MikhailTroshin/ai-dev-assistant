@@ -1,2 +1,32 @@
+# Среда разработки
 .venv
+
+# Секреты и конфиги
+.env
+.env.local
+*.pem
+*.key
+
+# Python
 **/__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+.pytest_cache/
+
+# Логи и данные
+logs/
+*.log
+data/*.db
+data/*.sqlite3
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
