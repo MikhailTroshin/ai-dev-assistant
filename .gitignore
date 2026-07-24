@@ -2,8 +2,12 @@
 .venv
 
 # Секреты и конфиги
+# Секреты
 .env
-.env.local
+.env.*
+!.env.example
+*.secret
+secrets/
 *.pem
 *.key
 
@@ -20,6 +24,10 @@ logs/
 *.log
 data/*.db
 data/*.sqlite3
+nohup.out
+
+# Docker
+.docker/
 
 # IDE
 .idea/

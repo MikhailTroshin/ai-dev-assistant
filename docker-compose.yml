@@ -9,39 +9,20 @@ services:
       - redis_data:/data
     command: redis-server --appendonly yes
 
-  worker:
-    build: .
-    container_name: ai_assistant_worker
-    restart: unless-stopped
-    env_file:
-      - .env
-    volumes:
-      # Монтируем репозиторий проекта внутрь контейнера, чтобы Claude Code мог с ним работать
-      - /home/ws/mtroshin/ragllm:/app/ragllm
-      # Монтируем конфиг Claude Code (если он глобальный или специфичный для пользователя)
-      - /home/ws/mtroshin/.claude:/root/.claude:ro
-      # Логи и БД
-      - ./logs:/app/logs
-      - ./data:/app/data
-    command: arq src.worker.worker.WorkerSettings
-    depends_on:
-      - redis
-
   bot:
-    build: .
+    build: 
+      context: .
+      dockerfile: Dockerfile.bot
     container_name: ai_assistant_bot
     restart: unless-stopped
     env_file:
       - .env
     volumes:
-      - /home/ws/mtroshin/ragllm:/app/ragllm
-      - /home/ws/mtroshin/.claude:/root/.claude:ro
       - ./logs:/app/logs
       - ./data:/app/data
     command: python -m src.bot.main
     depends_on:
       - redis
-      - worker
 
 volumes:
   redis_data:
