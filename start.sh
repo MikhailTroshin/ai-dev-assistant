@@ -2,19 +2,25 @@
 
 echo "🚀 Запуск AI Assistant..."
 
-# Запускаем Docker контейнеры (Redis + Bot)
-echo "📦 Запускаем Redis и Bot в Docker..."
-docker compose up -d --build
+# Запускаем Docker контейнеры (Redis)
+echo "📦 Запускаем Redis в Docker..."
+docker compose up -d redis
 
-# Запускаем Worker на хосте
-echo "⚙️ Запускаем Worker на хосте..."
-source venv/bin/activate
-nohup arq src.worker.worker.WorkerSettings > logs/worker.log 2>&1 &
+# Запускаем Worker через systemd
+echo "⚙️ Запускаем Worker через systemd..."
+sudo systemctl start ai-assistant-worker
+
+# Опционально: запускаем бот в Docker
+echo "🤖 Запускаем Bot в Docker..."
+docker compose up -d bot
 
 echo "✅ Система запущена!"
-echo "   Redis + Bot: в Docker"
-echo "   Worker: на хосте (PID: $!)"
+echo ""
+echo "Статус:"
+echo "  Worker: sudo systemctl status ai-assistant-worker"
+echo "  Docker: docker compose ps"
 echo ""
 echo "Логи:"
-echo "  Docker: docker compose logs -f"
 echo "  Worker: tail -f logs/worker.log"
+echo "  Bot: docker compose logs -f bot"
+echo "  Redis: docker compose logs -f redis"

@@ -10,6 +10,7 @@ from arq import create_pool
 from arq.connections import RedisSettings
 
 from src.core.claude_runner import claude_runner
+from src.core.database import db
 from config.settings import settings
 
 logging.basicConfig(
@@ -25,16 +26,31 @@ async def process_task(
     prompt: str,
     working_dir: Optional[str] = None,
     chat_id: Optional[int] = None,
-    user_id: Optional[int] = None
+    user_id: Optional[int] = None,
+    command: Optional[str] = None
 ) -> dict:
     """Обработчик задач из очереди"""
     logger.info(f"🚀 ПОЛУЧЕНА ЗАДАЧА {task_id}")
     logger.info(f"Промпт: {prompt[:100]}...")
-    logger.info(f"Рабочая директория: {working_dir}")
     
     start_time = datetime.now()
     work_dir = Path(working_dir) if working_dir else settings.ML_REPO_PATH
     
+    # Сохраняем начальную запись в БД
+    await db.save_task({
+        "task_id": task_id,
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "command": command or "unknown",
+        "prompt": prompt,
+        "result": None,
+        "success": False,
+        "error": None,
+        "duration_seconds": 0,
+        "created_at": start_time
+    })
+    
+    # Запускаем Claude Code
     logger.info("Запускаем Claude Code...")
     result = await claude_runner.run(
         prompt=prompt,
@@ -53,6 +69,15 @@ async def process_task(
         "user_id": user_id
     })
     
+    # Обновляем запись в БД
+    await db.update_task(task_id, {
+        "result": result.get("output", ""),
+        "success": result.get("success", False),
+        "error": result.get("error"),
+        "duration_seconds": duration,
+        "completed_at": end_time
+    })
+    
     logger.info(f"✅ Задача {task_id} завершена за {duration:.2f}с")
     
     # Сохраняем результат в Redis для бота
@@ -64,15 +89,12 @@ async def process_task(
         result_key = f"task_result:{task_id}"
         await redis_client.setex(
             result_key,
-            3600,  # Хранить 1 час
+            3600,
             json.dumps(result)
         )
         
-        # Помечаем задачу как готовую
         await redis_client.sadd("pending_results", task_id)
-        
         await redis_client.close()
-        logger.info(f"Результат сохранён в Redis: {result_key}")
     
     return result
 
@@ -90,10 +112,17 @@ class WorkerSettings:
     
     max_jobs = 1
     job_timeout = settings.TASK_TIMEOUT
+    
+    @staticmethod
+    async def on_startup(ctx):
+        logger.info("🟢 Worker запущен")
+        await db.init_db()  # Инициализируем БД при старте
 
 
 async def main():
     """Тестовый запуск"""
+    await db.init_db()
+    
     logger.info("Создаём пул Redis...")
     redis_pool = await create_pool(WorkerSettings.redis_settings)
     
@@ -101,25 +130,22 @@ async def main():
     task = await redis_pool.enqueue_job(
         'process_task',
         task_id="test-001",
-        prompt="Объясни структуру проекта в текущей директории",
+        prompt="Объясни структуру проекта",
         working_dir=str(settings.ML_REPO_PATH),
         chat_id=123456,
-        user_id=123456
+        user_id=123456,
+        command="test"
     )
     
     logger.info(f"Задача добавлена: {task.job_id}")
-    logger.info("Ожидаем результат (до 120с)...")
     
     try:
         result = await task.result(timeout=120)
-        logger.info(f"Результат получен")
-        print(f"\n✅ Результат получен")
+        logger.info("✅ Результат получен")
     except asyncio.TimeoutError:
-        logger.error("❌ Таймаут ожидания результата")
-        print("❌ Таймаут")
+        logger.error("❌ Таймаут")
         raise
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-    

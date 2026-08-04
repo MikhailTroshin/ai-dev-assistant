@@ -17,6 +17,9 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      # Переопределяем хост Redis ТОЛЬКО для контейнера бота
+      - REDIS_HOST=redis
     volumes:
       - ./logs:/app/logs
       - ./data:/app/data

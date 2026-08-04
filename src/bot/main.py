@@ -3,13 +3,13 @@ import json
 import logging
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.redis import RedisStorage
-from aiogram.types import Message
 
 import redis.asyncio as redis
 from arq import create_pool
 from arq.connections import RedisSettings
 
 from config.settings import settings
+from src.core.database import db
 from src.bot.handlers import router, send_long_message
 
 logging.basicConfig(
@@ -49,8 +49,8 @@ async def check_results(bot: Bot, redis_client: redis.Redis):
                             else:
                                 text = f"❌ Ошибка:\n\n{result['error']}"
                             
-                            # Отправляем как обычное сообщение (не reply)
-                            await bot.send_message(chat_id, text)
+                            # Используем send_long_message с bot
+                            await send_long_message(bot, text, chat_id=chat_id)
                             
                             # Удаляем из очереди
                             await redis_client.srem("pending_results", task_id)
@@ -69,34 +69,47 @@ async def check_results(bot: Bot, redis_client: redis.Redis):
 
 
 async def main():
+    """Запуск бота"""
     logger.info("Запуск Telegram бота...")
     
+    # Инициализируем базу данных
+    await db.init_db()
+    logger.info("База данных инициализирована")
+    
+    # Создаём бота
     bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
     
+    # Подключаемся к Redis для FSM
     redis_settings = RedisSettings(
         host=settings.REDIS_HOST,
         port=settings.REDIS_PORT,
         database=settings.REDIS_DB
     )
     
+    # Создаём пул Redis для очереди
     redis_pool = await create_pool(redis_settings)
     
+    # Создаём клиент Redis для фоновых задач
     redis_client = redis.from_url(
         f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}"
     )
     
+    # Создаём хранилище для FSM
     storage = RedisStorage.from_url(
         f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}"
     )
     
+    # Создаём диспетчер
     dp = Dispatcher(storage=storage)
     
+    # Передаём зависимости в handlers через middleware
     @dp.update.outer_middleware
     async def inject_deps(handler, event, data):
         data['redis_pool'] = redis_pool
         data['bot'] = bot
         return await handler(event, data)
     
+    # Подключаем роутер
     dp.include_router(router)
     
     # Запускаем фоновую задачу проверки результатов
@@ -105,6 +118,7 @@ async def main():
     logger.info("Бот запущен")
     
     try:
+        # Запускаем polling
         await dp.start_polling(bot)
     finally:
         check_task.cancel()
@@ -115,4 +129,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    

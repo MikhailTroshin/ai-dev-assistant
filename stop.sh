@@ -2,12 +2,12 @@
 
 echo "🛑 Остановка AI Assistant..."
 
-# Останавливаем Docker контейнеры
-echo "📦 Останавливаем Docker..."
-docker compose down
-
 # Останавливаем Worker
 echo "⚙️ Останавливаем Worker..."
-pkill -f "arq src.worker.worker.WorkerSettings"
+sudo systemctl stop ai-assistant-worker
+
+# Останавливаем Docker
+echo "📦 Останавливаем Docker..."
+docker compose down
 
 echo "✅ Система остановлена"
