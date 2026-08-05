@@ -91,17 +91,42 @@ async def process_something(
 ### Запуск и тестирование
 
 ```bash
-./start.sh              # Запуск всей системы
+./start.sh              # Запуск всей системы (Redis + Bot в Docker, Worker в systemd)
 ./stop.sh               # Остановка
 ./status.sh             # Статус
 
-docker compose logs -f  # Логи Docker (Redis + Bot)
-tail -f logs/worker.log # Логи Worker
+docker compose logs -f bot     # Логи бота
+tail -f logs/worker.log        # Логи Worker
+sudo journalctl -u ai-assistant-worker -f   # Логи systemd для Worker
+
+# Управление Worker
+sudo systemctl restart ai-assistant-worker
+sudo systemctl status  ai-assistant-worker
 
 # Тест конкретного компонента
 python test_claude_simple.py
 python test_claude_async.py
 python test_worker.py
+```
+
+### systemd-юнит Worker'а
+
+Worker работает как systemd-сервис `ai-assistant-worker`. Эталонный файл —
+`deploy/ai-assistant-worker.service`. Особенности:
+
+1. Worker запускается от обычного пользователя (владельца каталога проекта),
+   НЕ от root. Иначе будет `readonly database` при записи в SQLite.
+2. В `Environment=PATH=...` обязательно включён `~/.local/bin`, где лежит
+   `claude` CLI. Без него будет `[Errno 2] No such file or directory: 'claude'`.
+3. Worker запускается через `python3.12 -m arq ...`, а не через скрипт
+   `.venv/bin/arq` (shebang которого ломается при перемещении venv).
+4. Виртуальное окружение должно называться **`.venv`** (не `venv`).
+
+После изменения `deploy/ai-assistant-worker.service`:
+```bash
+sudo cp deploy/ai-assistant-worker.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl restart ai-assistant-worker
 ```
 
 ### Структура задач

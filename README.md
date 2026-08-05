@@ -63,9 +63,12 @@ ai_assistant/
 │   ├── worker/           # Worker для очереди
 │   │   └── worker.py     # Обработчик задач
 │   └── core/             # Общая логика
-│       └── claude_runner.py  # Обёртка для запуска Claude Code
+│       ├── claude_runner.py  # Обёртка для запуска Claude Code
+│       └── database.py       # SQLAlchemy (SQLite) для аудита задач
 ├── config/
 │   └── settings.py       # Конфигурация (pydantic-settings)
+├── deploy/
+│   └── ai-assistant-worker.service  # Эталонный systemd-юнит для worker
 ├── logs/                 # Логи (не в git)
 ├── data/                 # БД и временные файлы (не в git)
 ├── .env                  # Секреты (не в git)
@@ -98,8 +101,10 @@ git clone https://github.com/твой-ник/ai-dev-assistant.git
 cd ai-dev-assistant
 
 # 2. Создаём виртуальное окружение для worker
-python3.12 -m venv venv
-source venv/bin/activate
+#    ВАЖНО: каталог должен называться именно .venv — на него рассчитаны
+#    start.sh и systemd-юнит. НЕ используй имя `venv`.
+python3.12 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 
 # 3. Создаём .env файл (отредактируй значения под себя!)
@@ -120,19 +125,38 @@ TASK_TIMEOUT=900
 POLL_INTERVAL=5
 EOF
 
-# 4. Запускаем систему
+# 4. Подготавливаем каталоги для данных и логов
+mkdir -p data logs
+#    Каталоги должны принадлежать пользователю, от которого работает worker.
+#    Если создаёшь через sudo — исправь владельца:
+#    sudo chown -R $USER:$USER data logs
+
+# 5. Устанавливаем Worker как systemd-сервис
+sudo cp deploy/ai-assistant-worker.service /etc/systemd/system/
+#    При необходимости отредактируй пути (User, WorkingDirectory, PATH)
+#    под своего пользователя.
+sudo systemctl daemon-reload
+sudo systemctl enable ai-assistant-worker
+
+# 6. Запускаем систему
 ./start.sh
 ```
 
 ### Управление
 
 ```bash
-./start.sh      # Запуск
+./start.sh      # Запуск (Redis в Docker + Worker в systemd + Bot в Docker)
 ./stop.sh       # Остановка
-./status.sh     # Статус
+./status.sh     # Статус компонентов
 
-docker compose logs -f      # Логи Docker (Redis + Bot)
-tail -f logs/worker.log     # Логи Worker
+# Логи
+docker compose logs -f bot     # Логи бота
+tail -f logs/worker.log        # Логи Worker
+
+# Управление Worker (systemd)
+sudo systemctl restart ai-assistant-worker   # Перезапуск
+sudo systemctl status  ai-assistant-worker   # Подробный статус
+journalctl -u ai-assistant-worker -f         # Логи systemd
 ```
 
 ## 🤖 Команды бота
@@ -236,19 +260,70 @@ tail -f logs/worker.log     # Логи Worker
 
 ## 🐛 Troubleshooting
 
-### Worker не видит задачи
-- Проверь, что Redis запущен: `redis-cli ping`
-- Проверь имя очереди: `redis-cli KEYS '*queue*'`
+### Общая первичная проверка
 
-### Claude Code не отвечает
-- Проверь, что `claude` доступен: `which claude`
-- Проверь таймауты в `.env`
-- Посмотри логи: `tail -f logs/worker.log`
+```bash
+./status.sh                          # Состояние всех компонентов
+redis-cli ping                       # Доступен ли Redis
+sudo journalctl -u ai-assistant-worker -n 50   # Логи systemd для worker
+tail -n 50 logs/worker.log           # Логи приложения
+docker compose logs --tail=50 bot    # Логи бота
+```
+
+### Worker падает с `exit-code 203/EXEC`
+
+Systemd не может запустить процесс. Причины:
+- **Неверный путь к venv.** Юнит ожидает `.venv/bin/...`. Если каталог называется `venv` — пересоздай как `.venv` (см. раздел «Установка»), либо отредактируй `deploy/ai-assistant-worker.service`.
+- **Битый shebang в `.venv/bin/arq`.** Если venv был перемещён/переименован, shebang указывает на несуществующий python. Симптом: `/home/.../.venv/bin/arq: cannot execute: required file not found`. Решение — в эталонном юните worker запускается через `python3.12 -m arq ...` (модулем), что обходит битые shebang. Не заменяй `ExecStart` на прямой вызов `arq`.
+
+```bash
+sudo systemctl status ai-assistant-worker   # посмотреть код завершения
+sudo journalctl -u ai-assistant-worker -n 50
+```
+
+### Worker: `[Errno 2] No such file or directory: 'claude'`
+
+Worker не находит Claude Code CLI. Причина: systemd не подгружает `~/.bashrc` и не видит `~/.local/bin`, куда обычно ставится `claude`. Решение — `~/.local/bin` должен быть в `Environment=PATH=...` в юните:
+
+```bash
+grep PATH /etc/systemd/system/ai-assistant-worker.service
+# должно быть: Environment="PATH=/home/<user>/.local/bin:/home/<user>/ai_assistant/.venv/bin:..."
+```
+
+Если строчки нет — скопируй актуальный `deploy/ai-assistant-worker.service` и `daemon-reload`.
+
+### Worker: `sqlite3.OperationalError: attempt to write a readonly database`
+
+Файл `data/assistant.db` принадлежит не тому пользователю (часто `root` после ручного запуска через sudo). Worker работает от обычного пользователя и не может писать:
+
+```bash
+ls -l data/assistant.db
+sudo chown -R $USER:$USER data logs
+sudo systemctl restart ai-assistant-worker
+```
+
+### Worker не видит задачи (задача принята, но результата нет)
+
+1. Проверь, что worker активен: `systemctl is-active ai-assistant-worker` → должно быть `active`.
+2. Проверь очередь в Redis: `redis-cli zcard arq:queue` — если задачи копятся, worker либо упал, либо не подключён к тому же Redis.
+3. Проверь, что бот и worker смотрят на одну БД Redis (одинаковые `REDIS_HOST`/`REDIS_PORT`/`REDIS_DB`). В docker-compose бот использует `REDIS_HOST=redis`, а worker на хосте — `localhost`.
+
+### Claude Code не отвечает / таймауты
+
+- `which claude` — доступен ли CLI.
+- `claude --version` — работает ли.
+- Проверь таймауты в `.env` (`CLAUDE_TIMEOUT`, `TASK_TIMEOUT`).
+- В целевом проекте должен быть настроен `.claude/settings.json` (см. раздел выше).
 
 ### Бот не запускается
-- Проверь токен в `.env`
-- Проверь, что Redis доступен из контейнера
-- Логи: `docker compose logs bot`
+
+- Проверь токен в `.env`.
+- Проверь, что Redis доступен из контейнера: `docker compose logs bot | grep -i redis`.
+- Логи: `docker compose logs bot`.
+
+### «Задача не найдена» в `/task_details`
+
+Если worker упал до сохранения в БД (например, из-за `readonly database`), задача попадает в очередь, но не фиксируется. После исправления причины (см. выше) отправь задачу заново.
 
 ## 📄 Лицензия
 
@@ -265,17 +340,28 @@ MIT
 git clone https://github.com/MikhailTroshin/ai-dev-assistant.git
 cd ai-dev-assistant
 
-# 2. Создай виртуальное окружение и установи зависимости
-python3.12 -m venv venv
-source venv/bin/activate
+# 2. Создай виртуальное окружение (имя каталога — строго .venv!)
+python3.12 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 
 # 3. Создай .env файл
 cp .env.example .env  # или создай вручную
 # Заполни: TELEGRAM_BOT_TOKEN, REDIS_HOST, пути к проекту
 
-# 4. Убедись, что Claude Code установлен и настроен
-claude --version
+# 4. Подготовь каталоги и установи права
+mkdir -p data logs
+sudo chown -R $USER:$USER data logs
 
-# 5. Запусти систему
+# 5. Убедись, что Claude Code установлен и доступен
+claude --version
+which claude  # обычно ~/.local/bin/claude
+
+# 6. Установи и активируй systemd-юнит для worker
+sudo cp deploy/ai-assistant-worker.service /etc/systemd/system/
+#    Отредактируй пути внутри файла под своего пользователя!
+sudo systemctl daemon-reload
+sudo systemctl enable ai-assistant-worker
+
+# 7. Запусти систему
 ./start.sh

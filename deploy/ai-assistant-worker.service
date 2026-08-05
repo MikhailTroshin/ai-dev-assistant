@@ -1,0 +1,40 @@
+# Эталонный systemd-юнит для AI Assistant Worker.
+#
+# Установка:
+#   sudo cp deploy/ai-assistant-worker.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ai-assistant-worker
+#
+# ВАЖНО:
+#   1. Worker работает от пользователя, которому принадлежат каталоги проекта
+#      (data/, logs/) и venv. Иначе будет "readonly database" / "permission denied".
+#   2. В PATH обязательно должен быть каталог ~/.local/bin, куда ставится
+#      `claude` CLI. Иначе worker не найдёт Claude Code (exit "[Errno 2] No such
+#      file or directory: 'claude'").
+#   3. Worker запускается через `python -m arq ...`, а не через скрипт `.venv/bin/arq`,
+#      потому что shebang в консольных скриптах venv содержит абсолютный путь к
+#      python и ломается при переименовании/перемещении каталога venv.
+
+[Unit]
+Description=AI Assistant Worker
+After=network.target
+
+[Service]
+Type=simple
+User=mtroshin
+WorkingDirectory=/home/ws/mtroshin/ai_assistant
+
+# ~/.local/bin  — для `claude` CLI
+# .venv/bin     — для python и установленных пакетов
+Environment="PATH=/home/ws/mtroshin/.local/bin:/home/ws/mtroshin/ai_assistant/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+
+# Запуск через модуль arq (надёжнее, чем битый shebang в .venv/bin/arq)
+ExecStart=/home/ws/mtroshin/ai_assistant/.venv/bin/python3.12 -m arq src.worker.worker.WorkerSettings
+
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/ws/mtroshin/ai_assistant/logs/worker.log
+StandardError=append:/home/ws/mtroshin/ai_assistant/logs/worker.log
+
+[Install]
+WantedBy=multi-user.target
