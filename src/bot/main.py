@@ -10,7 +10,7 @@ from arq.connections import RedisSettings
 
 from config.settings import settings
 from src.core.database import db
-from src.bot.handlers import router, send_long_message
+from src.bot.handlers import router, send_long_message, set_redis_pool
 
 logging.basicConfig(
     level=logging.INFO,
@@ -88,6 +88,8 @@ async def main():
     
     # Создаём пул Redis для очереди
     redis_pool = await create_pool(redis_settings)
+    # Делаем пул доступным обработчикам кнопок и _submit_*-функциям
+    set_redis_pool(redis_pool)
     
     # Создаём клиент Redis для фоновых задач
     redis_client = redis.from_url(

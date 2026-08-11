@@ -34,7 +34,7 @@ fi
 
 # Запускаем бота в Docker
 echo "🤖 Запускаем Bot в Docker..."
-docker compose up -d bot
+docker compose up -d --build bot
 
 echo "✅ Система запущена!"
 echo ""
