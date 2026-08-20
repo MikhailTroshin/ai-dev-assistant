@@ -104,9 +104,9 @@ sudo systemctl restart ai-assistant-worker
 sudo systemctl status  ai-assistant-worker
 
 # Тест конкретного компонента
-python test_claude_simple.py
-python test_claude_async.py
-python test_worker.py
+python tests/test_claude_simple.py
+python tests/test_claude_async.py
+python tests/test_worker.py
 ```
 
 ### systemd-юнит Worker'а
@@ -335,9 +335,9 @@ Parser → Retriever (+Reranker) → Generator
 
 2. **Запусти тесты:**
    ```bash
-   python test_claude_simple.py
-   python test_claude_async.py
-   python test_worker.py
+   python tests/test_claude_simple.py
+   python tests/test_claude_async.py
+   python tests/test_worker.py
    ```
 
 3. **Проверь Docker:**
