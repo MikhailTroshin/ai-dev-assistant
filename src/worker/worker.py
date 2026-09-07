@@ -68,7 +68,7 @@ async def process_task(
     
     end_time = datetime.now()
     duration = (end_time - start_time).total_seconds()
-    
+
     result.update({
         "task_id": task_id,
         "duration_seconds": duration,
@@ -77,14 +77,27 @@ async def process_task(
         "chat_id": chat_id,
         "user_id": user_id
     })
-    
-    # Обновляем запись в БД
+
+    # Лог выполнения: служебная информация + лог Claude Code
+    run_logs = result.get("logs", "")
+    worker_log = (
+        f"task_id: {task_id}\n"
+        f"command: {command}\n"
+        f"project: {project}\n"
+        f"working_dir: {work_dir}\n"
+        f"prompt_len: {len(full_prompt)}\n"
+        f"timed_out: {result.get('timed_out', False)}\n"
+    )
+    full_logs = worker_log + run_logs
+
+    # Обновляем запись в БД (логи — всегда, даже при ошибке)
     await db.update_task(task_id, {
         "result": result.get("output", ""),
         "success": result.get("success", False),
         "error": result.get("error"),
         "duration_seconds": duration,
-        "completed_at": end_time
+        "completed_at": end_time,
+        "logs": full_logs,
     })
     
     logger.info(f"✅ Задача {task_id} завершена за {duration:.2f}с")
@@ -99,7 +112,13 @@ async def process_task(
         await redis_client.setex(
             result_key,
             3600,
-            json.dumps(result)
+            json.dumps({
+                "success": result.get("success", False),
+                "output": result.get("output", ""),
+                "error": result.get("error"),
+                "timed_out": result.get("timed_out", False),
+                "task_id": task_id,
+            })
         )
         
         await redis_client.sadd("pending_results", task_id)

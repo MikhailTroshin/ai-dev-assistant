@@ -938,6 +938,13 @@ async def _show_task_details(message: Message, task_id: str):
     if task.error:
         text += f"⚠️ Ошибка:\n```\n{task.error}\n```\n"
 
+    if task.logs:
+        logs_tail = task.logs[-1500:]
+        text += (
+            f"🖥 Логи выполнения (последние {len(logs_tail)} символов):\n"
+            f"```\n{logs_tail}\n```\n"
+        )
+
     await message.answer(text, parse_mode="Markdown")
 
 

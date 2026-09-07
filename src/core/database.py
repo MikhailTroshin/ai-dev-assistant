@@ -28,6 +28,7 @@ class TaskRecord(Base):
     duration_seconds = Column(Float)
     tokens_used = Column(Integer, nullable=True)
     project = Column(String(100), nullable=True)  # имя проекта из реестра PROJECTS
+    logs = Column(Text, nullable=True)  # технический лог выполнения (диагностика ошибок)
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
     
@@ -59,6 +60,9 @@ class Database:
             if "project" not in existing:
                 await conn.execute(text("ALTER TABLE tasks ADD COLUMN project VARCHAR(100)"))
                 logger.info("Миграция: добавлена колонка tasks.project")
+            if "logs" not in existing:
+                await conn.execute(text("ALTER TABLE tasks ADD COLUMN logs TEXT"))
+                logger.info("Миграция: добавлена колонка tasks.logs")
         logger.info("База данных инициализирована")
     
     async def save_task(self, task_data: dict) -> TaskRecord:

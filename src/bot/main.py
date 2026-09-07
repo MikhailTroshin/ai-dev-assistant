@@ -47,8 +47,17 @@ async def check_results(bot: Bot, redis_client: redis.Redis):
                             if result['success']:
                                 text = f"✅ Результат:\n\n{result['output']}"
                             else:
-                                text = f"❌ Ошибка:\n\n{result['error']}"
-                            
+                                text = (
+                                    f"❌ Ошибка в задаче `{result.get('task_id', task_id)}`:\n\n"
+                                    f"{result.get('error') or 'Неизвестная ошибка (нет описания)'}\n\n"
+                                    f"📖 Подробности и логи: `/task_details {result.get('task_id', task_id)}`"
+                                )
+
+                                # Частичный вывод при таймауте тоже полезен
+                                partial = result.get("output")
+                                if result.get("timed_out") and partial:
+                                    text += f"\n\n⚠️ Частичный вывод:\n{partial[:1500]}"
+
                             # Используем send_long_message с bot
                             await send_long_message(bot, text, chat_id=chat_id)
                             
