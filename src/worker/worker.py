@@ -11,6 +11,7 @@ from arq.connections import RedisSettings
 
 from src.core.claude_runner import claude_runner
 from src.core.database import db
+from src.core.project_context import build_repo_context
 from config.settings import settings, get_project_path, get_default_project
 
 logging.basicConfig(
@@ -18,28 +19,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-
-async def build_repo_map_hint(project: str) -> str:
-    """
-    Карта смежных репо для промпта: показывает Claude кросс-репо зависимости.
-    Пример: 'этот сервис вызывает X из репо frontend'.
-    """
-    lines = []
-    for name, cfg in settings.PROJECTS.items():
-        if name == project:
-            continue
-        desc = f" — {cfg.description}" if cfg.description else ""
-        lines.append(f"- репо `{name}`: {cfg.path}{desc}")
-    if not lines:
-        return ""
-    return (
-        "\n\n## Карта смежных репозиториев продукта\n"
-        "Текущая задача выполняется в репо "
-        f"`{project}`. Другие репозитории продукта (для понимания кросс-репо зависимостей):\n"
-        + "\n".join(lines)
-        + "\nЕсли правка затрагивает контракты (gRPC/proto, API), проверь потребителей в смежных репо."
-    )
 
 
 async def process_task(
@@ -50,18 +29,20 @@ async def process_task(
     chat_id: Optional[int] = None,
     user_id: Optional[int] = None,
     command: Optional[str] = None,
-    project: Optional[str] = None
+    project: Optional[str] = None,
+    extra_projects: Optional[list[str]] = None
 ) -> dict:
     """Обработчик задач из очереди"""
-    logger.info(f"🚀 ПОЛУЧЕНА ЗАДАЧА {task_id} (project={project})")
+    logger.info(f"🚀 ПОЛУЧЕНА ЗАДАЧА {task_id} (project={project}, extra={extra_projects})")
     logger.info(f"Промпт: {prompt[:100]}...")
 
     start_time = datetime.now()
     project = project or get_default_project()
     work_dir = Path(working_dir) if working_dir else get_project_path(project)
 
-    # Подмешиваем карту смежных репо в промпт
-    full_prompt = prompt + await build_repo_map_hint(project)
+    # Подмешиваем контекст репозиториев (связи, среды, тесты) в промпт.
+    # Проекты, упомянутые в тексте промпта, автоматически включаются в контекст.
+    full_prompt = prompt + build_repo_context(project, extra_projects, prompt_text=prompt)
 
     # Сохраняем начальную запись в БД
     await db.save_task({
@@ -144,6 +125,11 @@ class WorkerSettings:
     @staticmethod
     async def on_startup(ctx):
         logger.info("🟢 Worker запущен")
+        from config.settings import validate_relations
+        errors = validate_relations()
+        if errors:
+            logger.error(f"❌ Ошибки в реестре проектов: {errors}")
+            raise RuntimeError(f"Некорректная конфигурация PROJECTS: {errors}")
         await db.init_db()  # Инициализируем БД при старте
 
 
@@ -155,9 +141,10 @@ async def main():
     redis_pool = await create_pool(WorkerSettings.redis_settings)
     
     logger.info("Добавляем задачу в очередь...")
+    import uuid
     task = await redis_pool.enqueue_job(
         'process_task',
-        task_id="test-001",
+        task_id=f"test-{uuid.uuid4().hex[:8]}",
         prompt="Объясни структуру проекта",
         working_dir=str(settings.ML_REPO_PATH),
         chat_id=123456,

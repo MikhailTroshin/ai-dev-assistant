@@ -1,27 +1,31 @@
 from typing import Optional
 
-from pydantic import Field, field_validator
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 from pathlib import Path
 
 
-class ProjectConfig(BaseSettings):
+class ProjectConfig(BaseModel):
     """Конфигурация одного проекта (репозитория) продукта."""
     path: Path
     default: bool = False
     description: str = ""
+    # Виртуальная среда для запуска кода/тестов (папка venv)
     venv: Optional[Path] = None
+    # Произвольная команда активации среды (например, conda) — используется,
+    # если venv не подходит.
     venv_activate: str = ""
+    # Команда запуска тестов в этом репо
     test_cmd: str = ""
+    # Проекты, напрямую связанные с этим (соседи по графу зависимостей)
     related: list[str] = []
 
-    @field_validator("related")
-    @classmethod
-    def _check_related(cls, v: list[str]) -> list[str]:
-        for name in v:
-            if name not in settings.PROJECTS:
-                raise ValueError(f"Неизвестный связанный проект: {name}")
-        return v
+    @property
+    def python_bin(self) -> Optional[Path]:
+        """Путь до python-интерпретатора в venv (None, если venv не задан)."""
+        if self.venv is None:
+            return None
+        return self.venv / "bin" / "python"
 
 
 class Settings(BaseSettings):
@@ -118,3 +122,13 @@ def get_project_path(project: str | None) -> Path:
     if project and project in settings.PROJECTS:
         return settings.PROJECTS[project].path
     return settings.PROJECTS[get_default_project()].path
+
+
+def validate_relations() -> list[str]:
+    """Проверяет, что все related-ссылки указывают на существующие проекты."""
+    errors = []
+    for name, cfg in settings.PROJECTS.items():
+        for related_name in cfg.related:
+            if related_name not in settings.PROJECTS:
+                errors.append(f"{name}: неизвестный related-проект '{related_name}'")
+    return errors
