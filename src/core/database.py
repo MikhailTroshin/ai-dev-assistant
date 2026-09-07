@@ -1,7 +1,7 @@
 import logging
 from datetime import datetime
 from typing import Optional, List
-from sqlalchemy import Column, Integer, String, Text, DateTime, Float, Boolean
+from sqlalchemy import Column, Integer, String, Text, DateTime, Float, Boolean, text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -27,6 +27,7 @@ class TaskRecord(Base):
     error = Column(Text, nullable=True)
     duration_seconds = Column(Float)
     tokens_used = Column(Integer, nullable=True)
+    project = Column(String(100), nullable=True)  # имя проекта из реестра PROJECTS
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
     
@@ -49,9 +50,15 @@ class Database:
         )
     
     async def init_db(self):
-        """Создать таблицы"""
+        """Создать таблицы и применить миграции"""
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            # Миграция: колонка project (SQLite не поддерживает ADD COLUMN IF NOT EXISTS)
+            columns = await conn.execute(text("PRAGMA table_info(tasks)"))
+            existing = {row[1] for row in columns.fetchall()}
+            if "project" not in existing:
+                await conn.execute(text("ALTER TABLE tasks ADD COLUMN project VARCHAR(100)"))
+                logger.info("Миграция: добавлена колонка tasks.project")
         logger.info("База данных инициализирована")
     
     async def save_task(self, task_data: dict) -> TaskRecord:

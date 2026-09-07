@@ -11,13 +11,35 @@ from arq.connections import RedisSettings
 
 from src.core.claude_runner import claude_runner
 from src.core.database import db
-from config.settings import settings
+from config.settings import settings, get_project_path, get_default_project
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+async def build_repo_map_hint(project: str) -> str:
+    """
+    Карта смежных репо для промпта: показывает Claude кросс-репо зависимости.
+    Пример: 'этот сервис вызывает X из репо frontend'.
+    """
+    lines = []
+    for name, cfg in settings.PROJECTS.items():
+        if name == project:
+            continue
+        desc = f" — {cfg.description}" if cfg.description else ""
+        lines.append(f"- репо `{name}`: {cfg.path}{desc}")
+    if not lines:
+        return ""
+    return (
+        "\n\n## Карта смежных репозиториев продукта\n"
+        "Текущая задача выполняется в репо "
+        f"`{project}`. Другие репозитории продукта (для понимания кросс-репо зависимостей):\n"
+        + "\n".join(lines)
+        + "\nЕсли правка затрагивает контракты (gRPC/proto, API), проверь потребителей в смежных репо."
+    )
 
 
 async def process_task(
@@ -27,33 +49,39 @@ async def process_task(
     working_dir: Optional[str] = None,
     chat_id: Optional[int] = None,
     user_id: Optional[int] = None,
-    command: Optional[str] = None
+    command: Optional[str] = None,
+    project: Optional[str] = None
 ) -> dict:
     """Обработчик задач из очереди"""
-    logger.info(f"🚀 ПОЛУЧЕНА ЗАДАЧА {task_id}")
+    logger.info(f"🚀 ПОЛУЧЕНА ЗАДАЧА {task_id} (project={project})")
     logger.info(f"Промпт: {prompt[:100]}...")
-    
+
     start_time = datetime.now()
-    work_dir = Path(working_dir) if working_dir else settings.ML_REPO_PATH
-    
+    project = project or get_default_project()
+    work_dir = Path(working_dir) if working_dir else get_project_path(project)
+
+    # Подмешиваем карту смежных репо в промпт
+    full_prompt = prompt + await build_repo_map_hint(project)
+
     # Сохраняем начальную запись в БД
     await db.save_task({
         "task_id": task_id,
         "user_id": user_id,
         "chat_id": chat_id,
         "command": command or "unknown",
-        "prompt": prompt,
+        "prompt": full_prompt,
         "result": None,
         "success": False,
         "error": None,
         "duration_seconds": 0,
+        "project": project,
         "created_at": start_time
     })
-    
+
     # Запускаем Claude Code
-    logger.info("Запускаем Claude Code...")
+    logger.info(f"Запускаем Claude Code в {work_dir}...")
     result = await claude_runner.run(
-        prompt=prompt,
+        prompt=full_prompt,
         working_dir=work_dir
     )
     

@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 from aiogram import Router, F
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -10,7 +10,7 @@ from aiogram.fsm.state import State, StatesGroup
 import redis.asyncio as redis
 
 from src.core.database import db
-from config.settings import settings
+from config.settings import settings, get_project_path, get_default_project
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +44,16 @@ class RebaseStates(StatesGroup):
     waiting_for_branches = State()
 
 
+class ProjectStates(StatesGroup):
+    """Состояния для команды /project"""
+    waiting_for_project = State()
+
+
+class ContextStates(StatesGroup):
+    """Состояния флоу добавления контекста к задаче"""
+    waiting_for_context = State()
+
+
 class DetailsStates(StatesGroup):
     """Состояния для команды /task_details"""
     waiting_for_task_id = State()
@@ -63,6 +73,7 @@ BUTTON_ALIASES: dict[str, str] = {
     "📈 Статистика": "stats",
     "🔎 Детали задачи": "task_details",
     "📊 Статус": "status",
+    "🗂 Сменить проект": "project",
 }
 
 
@@ -75,7 +86,7 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="❓ Вопрос"), KeyboardButton(text="📋 Задача Jira")],
             [KeyboardButton(text="🐛 Баг"), KeyboardButton(text="🔍 Code Review")],
-            [KeyboardButton(text="🔧 Rebase")],
+            [KeyboardButton(text="🔧 Rebase"), KeyboardButton(text="🗂 Сменить проект")],
             [
                 KeyboardButton(text="📜 История"),
                 KeyboardButton(text="📈 Статистика"),
@@ -172,6 +183,151 @@ def _command_args(message_text: str) -> str | None:
     return parts[1].strip()
 
 
+# ==================== Флоу добавления контекста ====================
+
+# Команды, для которых доступен доп. контекст
+CONTEXT_COMMANDS = {"ask", "task", "bug", "code-review", "rebase"}
+
+# Callback-префиксы inline-кнопок флоу контекста
+CB_CONTEXT_ADD = "ctx:add:"
+CB_CONTEXT_SKIP = "ctx:skip:"
+CB_CONTEXT_CANCEL = "ctx:cancel:"
+
+
+def get_context_keyboard(command: str) -> InlineKeyboardMarkup:
+    """Inline-клавиатура «добавить контекст / отправить как есть»."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="➕ Добавить контекст", callback_data=CB_CONTEXT_ADD + command),
+                InlineKeyboardButton(text="🚀 Отправить как есть", callback_data=CB_CONTEXT_SKIP + command),
+            ],
+            [InlineButton_cancel(command)],
+        ]
+    )
+
+
+def InlineButton_cancel(command: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text="❌ Отмена", callback_data=CB_CONTEXT_CANCEL + command)
+
+
+async def _ask_context(message: Message, state: FSMContext, command: str, prompt: str, summary: str):
+    """
+    Спрашивает пользователя, хочет ли он добавить доп. контекст к задаче.
+    Сохраняет подготовленный промпт в FSM и переходит в состояние ожидания кнопки.
+    """
+    await state.set_state(ContextStates.waiting_for_context)
+    await state.update_data(ctx_command=command, ctx_prompt=prompt)
+    await message.answer(
+        f"{summary}\n\n"
+        f"💡 Хочешь добавить дополнительный контекст к задаче?\n"
+        f"Он будет подмешан в промпт для Claude Code.",
+        reply_markup=get_context_keyboard(command),
+    )
+
+
+@router.callback_query(F.data.startswith(CB_CONTEXT_ADD))
+async def cb_context_add(callback: CallbackQuery, state: FSMContext):
+    """Пользователь нажал «Добавить контекст» — ждём сообщение с контекстом."""
+    await callback.answer()
+    await state.update_data(ctx_awaiting_text=True)
+    await callback.message.answer(
+        "📝 Отправь сообщение с дополнительным контекстом "
+        "(файлы, ссылки, пояснения — всё, что поможет Claude):\n\n"
+        "Или напиши «отмена», чтобы прервать."
+    )
+
+
+@router.callback_query(F.data.startswith(CB_CONTEXT_SKIP))
+async def cb_context_skip(callback: CallbackQuery, state: FSMContext, redis_pool):
+    """Пользователь нажал «Отправить как есть» — сразу в очередь."""
+    await callback.answer()
+    data = await state.get_data()
+    command = data.get("ctx_command")
+    prompt = data.get("ctx_prompt", "")
+    await state.clear()
+    await callback.message.answer("🚀 Отправляю без доп. контекса...", reply_markup=get_main_keyboard())
+    await _submit_prompt(callback.message, command, prompt, redis_pool)
+
+
+@router.callback_query(F.data.startswith(CB_CONTEXT_CANCEL))
+async def cb_context_cancel(callback: CallbackQuery, state: FSMContext):
+    """Отмена флоу контекста."""
+    await callback.answer()
+    await state.clear()
+    await callback.message.answer("❌ Действие отменено. Выбери команду на клавиатуре.", reply_markup=get_main_keyboard())
+
+
+@router.message(ContextStates.waiting_for_context, F.text)
+async def process_context_text(message: Message, state: FSMContext, redis_pool):
+    """Получено сообщение с доп. контекстом — отправляем задачу с ним."""
+    data = await state.get_data()
+    if not data.get("ctx_awaiting_text"):
+        return
+    command = data.get("ctx_command")
+    prompt = data.get("ctx_prompt", "")
+    extra = message.text
+    await state.clear()
+    await message.answer("✅ Контекст добавлен. Отправляю задачу...", reply_markup=get_main_keyboard())
+    await _submit_prompt(message, command, f"{prompt}\n\n## Дополнительный контекст от пользователя\n{extra}", redis_pool)
+
+
+async def get_user_project(user_id: int) -> str:
+    """Активный проект пользователя (хранится в Redis), иначе дефолтный."""
+    redis_client = redis.from_url(
+        f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}"
+    )
+    try:
+        project = await redis_client.get(f"user_project:{user_id}")
+        if project:
+            project = project.decode("utf-8")
+            if project in settings.PROJECTS:
+                return project
+    finally:
+        await redis_client.close()
+    return get_default_project()
+
+
+async def set_user_project(user_id: int, project: str) -> None:
+    redis_client = redis.from_url(
+        f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}"
+    )
+    try:
+        await redis_client.set(f"user_project:{user_id}", project)
+    finally:
+        await redis_client.close()
+
+
+async def _submit_prompt(message: Message, command: str, prompt: str, redis_pool=None):
+    """Постановка задачи в очередь с готовым промптом (общая для всех команд)."""
+    redis_pool = redis_pool or _RedisPoolHolder.pool
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    task_id = f"{command}_{user_id}_{message.message_id}"
+    project = await get_user_project(user_id)
+
+    await message.answer(
+        f"⏳ Задача принята!\n"
+        f"ID: `{task_id}`\n"
+        f"🗂 Проект: `{project}`\n\n"
+        f"Сообщу, когда будет готово (может занять до 10 минут)",
+        parse_mode="Markdown",
+    )
+
+    await redis_pool.enqueue_job(
+        'process_task',
+        task_id=task_id,
+        prompt=prompt,
+        working_dir=str(get_project_path(project)),
+        chat_id=chat_id,
+        user_id=user_id,
+        command=command,
+        project=project,
+    )
+
+    await save_task_mapping(task_id, chat_id, user_id)
+
+
 # ==================== Базовые команды ====================
 
 @router.message(Command("start"))
@@ -189,6 +345,11 @@ async def cmd_start(message: Message):
 /bug - Проанализировать баг по логам/описанию
 /code-review - Code review по задаче Jira
 /rebase - Rebase ветки с AI-помощью
+
+Для каждой команды можно добавить доп. контекст — он будет подмешан в промпт.
+
+🗂 Проекты:
+/project - Выбрать активный репозиторий (мульти-репо)
 
 📊 Мониторинг:
 /history - Мои последние задачи
@@ -241,6 +402,8 @@ async def handle_button(message: Message, state: FSMContext):
         await _enter_rebase(message, state)
     elif command == "task_details":
         await _enter_details(message, state)
+    elif command == "project":
+        await _enter_project(message, state)
     elif command == "history":
         await cmd_history(message)
     elif command == "stats":
@@ -266,8 +429,11 @@ async def cmd_ask(message: Message, state: FSMContext):
     """
     inline = _command_args(message.text)
     if inline:
-        await state.clear()
-        await _submit_ask(message, inline)
+        await _ask_context(
+            message, state, "ask",
+            prompt=f"Ответь на вопрос по проекту: {inline}",
+            summary=f"❓ Вопрос: {inline[:200]}",
+        )
         return
     await _enter_ask(message, state)
 
@@ -282,33 +448,20 @@ async def process_question(message: Message, state: FSMContext, redis_pool):
         await state.clear()
         return
 
-    await state.clear()
-    await _submit_ask(message, question, redis_pool)
+    await _ask_context(
+        message, state, "ask",
+        prompt=f"Ответь на вопрос по проекту: {question}",
+        summary=f"❓ Вопрос: {question[:200]}",
+    )
 
 
 async def _submit_ask(message: Message, question: str, redis_pool=None):
     """Фактическая постановка задачи ask в очередь."""
-    redis_pool = redis_pool or _RedisPoolHolder.pool
-    task_id = f"ask_{message.from_user.id}_{message.message_id}"
-
-    await message.answer(
-        f"⏳ Задача принята!\n"
-        f"ID: `{task_id}`\n\n"
-        f"Сообщу, когда будет готово (может занять до 10 минут)",
-        parse_mode="Markdown"
+    await _submit_prompt(
+        message, "ask",
+        f"Ответь на вопрос по проекту: {question}",
+        redis_pool,
     )
-
-    await redis_pool.enqueue_job(
-        'process_task',
-        task_id=task_id,
-        prompt=f"Ответь на вопрос по проекту: {question}",
-        working_dir=str(settings.ML_REPO_PATH),
-        chat_id=message.chat.id,
-        user_id=message.from_user.id,
-        command="ask"
-    )
-
-    await save_task_mapping(task_id, message.chat.id, message.from_user.id)
 
 
 # ==================== /task ====================
@@ -324,8 +477,12 @@ async def cmd_task(message: Message, state: FSMContext):
     """Обработчик команды /task. Поддерживает inline-аргумент."""
     inline = _command_args(message.text)
     if inline:
-        await state.clear()
-        await _submit_task(message, inline, _RedisPoolHolder.pool)
+        task_key = inline.strip().upper()
+        await _ask_context(
+            message, state, "task",
+            prompt=f"Прочитай задачу {task_key} из Jira и покажи её описание, требования и критерии приёмки. Если есть вложения - проанализируй их.",
+            summary=f"📋 Задача Jira: {task_key}",
+        )
         return
     await _enter_task(message, state)
 
@@ -340,34 +497,21 @@ async def process_task_key(message: Message, state: FSMContext, redis_pool):
         await state.clear()
         return
 
-    await state.clear()
-    await _submit_task(message, task_key, redis_pool)
+    await _ask_context(
+        message, state, "task",
+        prompt=f"Прочитай задачу {task_key} из Jira и покажи её описание, требования и критерии приёмки. Если есть вложения - проанализируй их.",
+        summary=f"📋 Задача Jira: {task_key}",
+    )
 
 
 async def _submit_task(message: Message, task_key: str, redis_pool=None):
     """Фактическая постановка задачи task в очередь."""
-    redis_pool = redis_pool or _RedisPoolHolder.pool
     task_key = task_key.strip().upper()
-    task_id = f"task_{message.from_user.id}_{message.message_id}"
-
-    await message.answer(
-        f"⏳ Задача принята!\n"
-        f"ID: `{task_id}`\n\n"
-        f"Получаю информацию о задаче {task_key}...",
-        parse_mode="Markdown"
+    await _submit_prompt(
+        message, "task",
+        f"Прочитай задачу {task_key} из Jira и покажи её описание, требования и критерии приёмки. Если есть вложения - проанализируй их.",
+        redis_pool,
     )
-
-    await redis_pool.enqueue_job(
-        'process_task',
-        task_id=task_id,
-        prompt=f"Прочитай задачу {task_key} из Jira и покажи её описание, требования и критерии приёмки. Если есть вложения - проанализируй их.",
-        working_dir=str(settings.ML_REPO_PATH),
-        chat_id=message.chat.id,
-        user_id=message.from_user.id,
-        command="task"
-    )
-
-    await save_task_mapping(task_id, message.chat.id, message.from_user.id)
 
 
 # ==================== /bug ====================
@@ -383,8 +527,11 @@ async def cmd_bug(message: Message, state: FSMContext):
     """Обработчик команды /bug. Поддерживает inline-аргумент."""
     inline = _command_args(message.text)
     if inline:
-        await state.clear()
-        await _submit_bug(message, inline, _RedisPoolHolder.pool)
+        await _ask_context(
+            message, state, "bug",
+            prompt=f"Проанализируй этот баг и найди возможные причины в коде:\n\n{inline}",
+            summary=f"🐛 Баг: {inline[:200]}",
+        )
         return
     await _enter_bug(message, state)
 
@@ -393,33 +540,20 @@ async def cmd_bug(message: Message, state: FSMContext):
 async def process_bug_text(message: Message, state: FSMContext, redis_pool):
     """Обработка текстового описания бага"""
     bug_description = message.text
-    await state.clear()
-    await _submit_bug(message, bug_description, redis_pool)
+    await _ask_context(
+        message, state, "bug",
+        prompt=f"Проанализируй этот баг и найди возможные причины в коде:\n\n{bug_description}",
+        summary=f"🐛 Баг: {bug_description[:200]}",
+    )
 
 
 async def _submit_bug(message: Message, bug_description: str, redis_pool=None):
     """Фактическая постановка задачи bug в очередь."""
-    redis_pool = redis_pool or _RedisPoolHolder.pool
-    task_id = f"bug_{message.from_user.id}_{message.message_id}"
-
-    await message.answer(
-        f"⏳ Задача принята!\n"
-        f"ID: `{task_id}`\n\n"
-        f"Анализирую баг...",
-        parse_mode="Markdown"
+    await _submit_prompt(
+        message, "bug",
+        f"Проанализируй этот баг и найди возможные причины в коде:\n\n{bug_description}",
+        redis_pool,
     )
-
-    await redis_pool.enqueue_job(
-        'process_task',
-        task_id=task_id,
-        prompt=f"Проанализируй этот баг и найди возможные причины в коде:\n\n{bug_description}",
-        working_dir=str(settings.ML_REPO_PATH),
-        chat_id=message.chat.id,
-        user_id=message.from_user.id,
-        command="bug"
-    )
-
-    await save_task_mapping(task_id, message.chat.id, message.from_user.id)
 
 
 # ==================== /code-review ====================
@@ -435,8 +569,18 @@ async def cmd_code_review(message: Message, state: FSMContext):
     """Обработчик команды /code-review. Поддерживает inline-аргумент."""
     inline = _command_args(message.text)
     if inline:
-        await state.clear()
-        await _submit_review(message, inline, _RedisPoolHolder.pool)
+        jira_key = inline.strip().upper()
+        await _ask_context(
+            message, state, "code-review",
+            prompt=f"""
+    Выполни code review для задачи {jira_key}.
+    1. Используй skill `jira-lookup`, чтобы найти задачу и получить ссылку на GitLab MR.
+    2. Используй skill `gitlab-mr-review` (или MCP gitlab), чтобы получить diff и комментарии к MR.
+    3. Проанализируй изменения. Найди потенциальные баги, проблемы с архитектурой или логикой.
+    4. Верни краткий структурированный отчет на русском языке.
+    """,
+            summary=f"🔍 Code review по задаче {jira_key}",
+        )
         return
     await _enter_review(message, state)
 
@@ -451,23 +595,22 @@ async def process_review_key(message: Message, state: FSMContext, redis_pool):
         await state.clear()
         return
 
-    await state.clear()
-    await _submit_review(message, jira_key, redis_pool)
+    await _ask_context(
+        message, state, "code-review",
+        prompt=f"""
+    Выполни code review для задачи {jira_key}.
+    1. Используй skill `jira-lookup`, чтобы найти задачу и получить ссылку на GitLab MR.
+    2. Используй skill `gitlab-mr-review` (или MCP gitlab), чтобы получить diff и комментарии к MR.
+    3. Проанализируй изменения. Найди потенциальные баги, проблемы с архитектурой или логикой.
+    4. Верни краткий структурированный отчет на русском языке.
+    """,
+        summary=f"🔍 Code review по задаче {jira_key}",
+    )
 
 
 async def _submit_review(message: Message, jira_key: str, redis_pool=None):
     """Фактическая постановка задачи code-review в очередь."""
-    redis_pool = redis_pool or _RedisPoolHolder.pool
     jira_key = jira_key.strip().upper()
-    task_id = f"review_{message.from_user.id}_{message.message_id}"
-
-    await message.answer(
-        f"⏳ Задача принята!\n"
-        f"ID: `{task_id}`\n\n"
-        f"Ищу MR по задаче {jira_key} и провожу code review...",
-        parse_mode="Markdown"
-    )
-
     prompt = f"""
     Выполни code review для задачи {jira_key}.
     1. Используй skill `jira-lookup`, чтобы найти задачу и получить ссылку на GitLab MR.
@@ -475,18 +618,7 @@ async def _submit_review(message: Message, jira_key: str, redis_pool=None):
     3. Проанализируй изменения. Найди потенциальные баги, проблемы с архитектурой или логикой.
     4. Верни краткий структурированный отчет на русском языке.
     """
-
-    await redis_pool.enqueue_job(
-        'process_task',
-        task_id=task_id,
-        prompt=prompt,
-        working_dir=str(settings.ML_REPO_PATH),
-        chat_id=message.chat.id,
-        user_id=message.from_user.id,
-        command="code-review"
-    )
-
-    await save_task_mapping(task_id, message.chat.id, message.from_user.id)
+    await _submit_prompt(message, "code-review", prompt, redis_pool)
 
 
 # ==================== /rebase ====================
@@ -507,8 +639,35 @@ async def cmd_rebase(message: Message, state: FSMContext):
     """Обработчик команды /rebase. Поддерживает inline-аргументы."""
     inline = _command_args(message.text)
     if inline and len(inline.split()) >= 2:
-        await state.clear()
-        await _submit_rebase(message, inline, _RedisPoolHolder.pool)
+        parts = inline.split()
+        branch_a, branch_b = parts[0], parts[1]
+        task_id = f"rebase_{message.from_user.id}_{message.message_id}"
+        prompt = f"""
+    Выполни безопасный git rebase в директории проекта.
+    Целевая ветка: {branch_a}
+    Исходная ветка: {branch_b}
+
+    Строго следуй алгоритму:
+    1. `git fetch --all`
+    2. `git checkout {branch_b}`
+    3. `git checkout -b {branch_b}_backup_{task_id}` (создай бекап ветки!)
+    4. `git checkout {branch_b}`
+    5. `git rebase {branch_a}`
+    6. ЕСЛИ возникли конфликты:
+       - Определи конфликтующие файлы через `git status`.
+       - Прочитай содержимое конфликтующих файлов.
+       - Проанализируй конфликт и предложи корректное решение.
+       - Внеси исправления в файлы.
+       - Выполни `git add <файлы>` и `git rebase --continue`.
+       - Повторяй, пока rebase не завершится.
+    7. Если rebase успешен, выполни `git push --force-with-lease origin {branch_b}`.
+    8. Сообщай о каждом шаге. Если требуется вмешательство человека (невозможно разрешить автоматически), остановись и четко опиши проблему.
+    """
+        await _ask_context(
+            message, state, "rebase",
+            prompt=prompt,
+            summary=f"🔧 Rebase {branch_b} onto {branch_a}",
+        )
         return
     await _enter_rebase(message, state)
 
@@ -525,25 +684,10 @@ async def process_rebase_branches(message: Message, state: FSMContext, redis_poo
         await state.clear()
         return
 
-    await state.clear()
-    await _submit_rebase(message, " ".join(args[:2]), redis_pool)
-
-
-async def _submit_rebase(message: Message, branches: str, redis_pool=None):
-    """Фактическая постановка задачи rebase в очередь."""
-    redis_pool = redis_pool or _RedisPoolHolder.pool
+    branches = " ".join(args[:2])
     parts = branches.split()
-    branch_a = parts[0].strip()  # целевая (куда вливаем)
-    branch_b = parts[1].strip()  # исходная (которую ребейзим)
+    branch_a, branch_b = parts[0], parts[1]
     task_id = f"rebase_{message.from_user.id}_{message.message_id}"
-
-    await message.answer(
-        f"⏳ Задача принята!\n"
-        f"ID: `{task_id}`\n\n"
-        f"Выполняю rebase {branch_b} onto {branch_a}.\n"
-        f"Если будут конфликты, ИИ попробует их разрешить...",
-        parse_mode="Markdown"
-    )
 
     prompt = f"""
     Выполни безопасный git rebase в директории проекта.
@@ -567,17 +711,123 @@ async def _submit_rebase(message: Message, branches: str, redis_pool=None):
     8. Сообщай о каждом шаге. Если требуется вмешательство человека (невозможно разрешить автоматически), остановись и четко опиши проблему.
     """
 
-    await redis_pool.enqueue_job(
-        'process_task',
-        task_id=task_id,
+    await _ask_context(
+        message, state, "rebase",
         prompt=prompt,
-        working_dir=str(settings.ML_REPO_PATH),
-        chat_id=message.chat.id,
-        user_id=message.from_user.id,
-        command="rebase"
+        summary=f"🔧 Rebase {branch_b} onto {branch_a}",
     )
 
-    await save_task_mapping(task_id, message.chat.id, message.from_user.id)
+
+async def _submit_rebase(message: Message, branches: str, redis_pool=None):
+    """Фактическая постановка задачи rebase в очередь (используется при inline-аргументах)."""
+    parts = branches.split()
+    branch_a = parts[0].strip()  # целевая (куда вливаем)
+    branch_b = parts[1].strip()  # исходная (которую ребейзим)
+    task_id = f"rebase_{message.from_user.id}_{message.message_id}"
+
+    prompt = f"""
+    Выполни безопасный git rebase в директории проекта.
+    Целевая ветка: {branch_a}
+    Исходная ветка: {branch_b}
+
+    Строго следуй алгоритму:
+    1. `git fetch --all`
+    2. `git checkout {branch_b}`
+    3. `git checkout -b {branch_b}_backup_{task_id}` (создай бекап ветки!)
+    4. `git checkout {branch_b}`
+    5. `git rebase {branch_a}`
+    6. ЕСЛИ возникли конфликты:
+       - Определи конфликтующие файлы через `git status`.
+       - Прочитай содержимое конфликтующих файлов.
+       - Проанализируй конфликт и предложи корректное решение.
+       - Внеси исправления в файлы.
+       - Выполни `git add <файлы>` и `git rebase --continue`.
+       - Повторяй, пока rebase не завершится.
+    7. Если rebase успешен, выполни `git push --force-with-lease origin {branch_b}`.
+    8. Сообщай о каждом шаге. Если требуется вмешательство человека (невозможно разрешить автоматически), остановись и четко опиши проблему.
+    """
+
+    await _submit_prompt(message, "rebase", prompt, redis_pool)
+
+
+# ==================== /project (выбор активного репозитория) ====================
+
+CB_PROJECT_PREFIX = "project:select:"
+
+
+def get_project_keyboard_inline() -> InlineKeyboardMarkup:
+    """Inline-клавиатура выбора проекта из реестра PROJECTS."""
+    buttons = [
+        [InlineKeyboardButton(text=name, callback_data=CB_PROJECT_PREFIX + name)]
+        for name in settings.PROJECTS
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def _enter_project(message: Message, state: FSMContext):
+    """Начало флоу /project."""
+    current = await get_user_project(message.from_user.id)
+    await state.set_state(ProjectStates.waiting_for_project)
+    lines = "\n".join(
+        f"  • `{name}` — {cfg.description or 'без описания'}"
+        for name, cfg in settings.PROJECTS.items()
+    )
+    await message.answer(
+        f"🗂 Текущий проект: `{current}`\n\n"
+        f"Доступные проекты:\n{lines}\n\n"
+        f"Выбери проект кнопкой ниже 👇",
+        parse_mode="Markdown",
+        reply_markup=get_project_keyboard_inline(),
+    )
+
+
+@router.message(Command("project"))
+async def cmd_project(message: Message, state: FSMContext):
+    """Выбор активного проекта. Поддерживает inline-аргумент (/project ragllm)."""
+    inline = _command_args(message.text)
+    if inline and inline.strip() in settings.PROJECTS:
+        await state.clear()
+        await set_user_project(message.from_user.id, inline.strip())
+        await message.answer(f"✅ Активный проект: `{inline.strip()}`", parse_mode="Markdown")
+        return
+    await _enter_project(message, state)
+
+
+@router.callback_query(F.data.startswith(CB_PROJECT_PREFIX))
+async def cb_project_select(callback: CallbackQuery, state: FSMContext):
+    """Выбор проекта по inline-кнопке."""
+    await callback.answer()
+    project = callback.data[len(CB_PROJECT_PREFIX):]
+    if project not in settings.PROJECTS:
+        await callback.message.answer(f"❌ Неизвестный проект: {project}")
+        return
+    await state.clear()
+    await set_user_project(callback.from_user.id, project)
+    await callback.message.answer(
+        f"✅ Активный проект: `{project}`\n"
+        f"📂 Все новые задачи будут выполняться в нём.",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard(),
+    )
+
+
+@router.message(ProjectStates.waiting_for_project, F.text)
+async def process_project_text(message: Message, state: FSMContext):
+    """Выбор проекта текстом (имя проекта)."""
+    name = (message.text or "").strip()
+    if name not in settings.PROJECTS:
+        await message.answer(
+            "❌ Нет такого проекта. Выбери кнопкой:",
+            reply_markup=get_project_keyboard_inline(),
+        )
+        return
+    await state.clear()
+    await set_user_project(message.from_user.id, name)
+    await message.answer(
+        f"✅ Активный проект: `{name}`",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard(),
+    )
 
 
 # ==================== Мониторинг и статистика ====================
@@ -670,8 +920,9 @@ async def _show_task_details(message: Message, task_id: str):
     text = f"""
 📝 Задача: `{task.task_id}`
 
-📌 Команда: {task.command}
-{'✅ Успешно' if task.success else '❌ Ошибка'}
+    📌 Команда: {task.command}
+    🗂 Проект: {task.project or 'N/A'}
+    {'✅ Успешно' if task.success else '❌ Ошибка'}
 ⏱ Время: {task.duration_seconds:.2f}с
 📅 Создана: {task.created_at.strftime('%d.%m.%Y %H:%M')}
 """
