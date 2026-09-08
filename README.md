@@ -68,9 +68,11 @@ ai_assistant/
 ├── config/
 │   └── settings.py       # Конфигурация (pydantic-settings)
 ├── deploy/
-│   └── ai-assistant-worker.service  # Эталонный systemd-юнит для worker
+│   ├── ai-assistant-worker.service  # Эталонный systemd-юнит для worker
+│   └── install_host_deps.sh         # Установка Claude Code, Node.js, uv, MCP
 ├── logs/                 # Логи (не в git)
 ├── data/                 # БД и временные файлы (не в git)
+├── .env.example          # Шаблон конфигурации (секреты в .env, не в git)
 ├── .env                  # Секреты (не в git)
 ├── docker-compose.yml    # Docker конфигурация
 ├── Dockerfile.bot        # Dockerfile для бота
@@ -90,8 +92,9 @@ ai_assistant/
 - Ubuntu 22.04+ (или другой Linux)
 - Python 3.12+
 - Docker и Docker Compose
-- Claude Code CLI (установлен и настроен)
 - Доступ к проекту, с которым будет работать ассистент
+
+Claude Code CLI, Node.js, uv и MCP-серверы ставятся скриптом (шаг 2 ниже) — вручную ничего устанавливать не нужно.
 
 ### Установка
 
@@ -100,45 +103,42 @@ ai_assistant/
 git clone https://github.com/твой-ник/ai-dev-assistant.git
 cd ai-dev-assistant
 
-# 2. Создаём виртуальное окружение для worker
+# 2. Устанавливаем хостовые зависимости (Claude Code, Node.js, uv, MCP jira/gitlab)
+#    Креды можно передать через env (см. deploy/install_host_deps.sh) или ввести интерактивно:
+JIRA_URL=https://your-jira.atlassian.net \
+JIRA_USERNAME=your@email.com \
+JIRA_API_TOKEN=... \
+GITLAB_API_URL=https://gitlab.yourcompany.com/api/v4 \
+GITLAB_PERSONAL_ACCESS_TOKEN=... \
+./deploy/install_host_deps.sh
+
+# 3. Создаём виртуальное окружение для worker
 #    ВАЖНО: каталог должен называться именно .venv — на него рассчитаны
 #    start.sh и systemd-юнит. НЕ используй имя `venv`.
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# 3. Создаём .env файл (отредактируй значения под себя!)
-cat > .env << 'EOF'
-REDIS_HOST=localhost
-REDIS_PORT=6379
-REDIS_DB=0
-PROJECT_PATH=/home/ws/mtroshin/ai_assistant
-ML_REPO_PATH=/home/ws/mtroshin/ragllm
-CLAUDE_CODE_PATH=claude
-CLAUDE_TIMEOUT=600
-DATABASE_URL=sqlite+aiosqlite:///data/assistant.db
-LOG_LEVEL=INFO
-LOG_FILE=logs/assistant.log
-TELEGRAM_BOT_TOKEN=your_bot_token_here
-TELEGRAM_ADMIN_ID=your_telegram_user_id
-TASK_TIMEOUT=900
-POLL_INTERVAL=5
-EOF
+# 4. Создаём .env из примера и редактируем
+cp .env.example .env
+$EDITOR .env   # TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_ID, пути к репо
 
-# 4. Подготавливаем каталоги для данных и логов
+# 5. Подготавливаем каталоги для данных и логов
 mkdir -p data logs
 #    Каталоги должны принадлежать пользователю, от которого работает worker.
 #    Если создаёшь через sudo — исправь владельца:
 #    sudo chown -R $USER:$USER data logs
 
-# 5. Устанавливаем Worker как systemd-сервис
+# 6. Настраиваем API-модели для Claude Code (см. раздел «Конфигурация Claude Code» ниже)
+
+# 7. Устанавливаем Worker как systemd-сервис
 sudo cp deploy/ai-assistant-worker.service /etc/systemd/system/
 #    При необходимости отредактируй пути (User, WorkingDirectory, PATH)
 #    под своего пользователя.
 sudo systemctl daemon-reload
 sudo systemctl enable ai-assistant-worker
 
-# 6. Запускаем систему
+# 8. Запускаем систему
 ./start.sh
 ```
 
@@ -175,24 +175,49 @@ journalctl -u ai-assistant-worker -f         # Логи systemd
 
 ## ⚙️ Конфигурация Claude Code
 
-Для работы ассистента в целевом проекте (например, `ragllm`) должен быть настроен `.claude/settings.json`:
+Ассистент запускает Claude Code в headless-режиме (`claude -p "<промпт>"`) от имени
+вашего пользователя, поэтому вся конфигурация живёт в `~/.claude/` и `~/.claude.json`.
+
+Скрипт `deploy/install_host_deps.sh` выполняет шаги 2–4 автоматически; ниже — что
+он делает и как настроить вручную.
+
+### 1. API-модели — `~/.claude/settings.json`
+
+Claude Code должен знать endpoint и модель (пример для прокси z.ai / GLM):
 
 ```json
 {
   "env": {
-    "ANTHROPIC_BASE_URL": "https://your-api.com",
-    "ANTHROPIC_AUTH_TOKEN": "sk-..."
+    "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+    "ANTHROPIC_AUTH_TOKEN": "sk-...",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.7",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.1",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.3"
   },
+  "model": "SONNET",
   "permissions": {
     "allow": [
       "Bash(*)",
-      "Edit(*)",
-      "Read(*)",
-      "WebFetch(*)",
-      "TodoWrite(*)"
+      "mcp__jira",
+      "mcp__gitlab"
     ],
     "defaultMode": "dontAsk"
-  },
+  }
+}
+```
+
+**Важно про permissions:** в headless-режиме (`dontAsk`) инструмент без записи в
+`allow` молча отклоняется. Если Claude пишет «инструмент недоступен» — добавьте
+`mcp__<имя-сервера>` в allowlist.
+
+### 2. MCP-серверы — `~/.claude.json` (НЕ settings.json!)
+
+В Claude Code >= 2.1 секция `mcpServers` из `~/.claude/settings.json`
+**игнорируется** — серверы регистрируются только в `~/.claude.json`
+(эквивалент `claude mcp add -s user`). Скрипт установки прописывает их туда:
+
+```json
+{
   "mcpServers": {
     "jira": {
       "command": "uvx",
@@ -205,16 +230,46 @@ journalctl -u ai-assistant-worker -f         # Логи systemd
     },
     "gitlab": {
       "command": "npx",
-      "args": [
-        "-y",
-        "@zereight/mcp-gitlab",
-        "--token=YOUR_TOKEN",
-        "--api-url=https://gitlab.yourcompany.com/api/v4"
-      ]
+      "args": ["-y", "@zereight/mcp-gitlab@latest"],
+      "env": {
+        "GITLAB_PERSONAL_ACCESS_TOKEN": "glpat-...",
+        "GITLAB_API_URL": "https://gitlab.yourcompany.com/api/v4"
+      }
     }
   }
 }
 ```
+
+### 3. Runtime-зависимости MCP
+
+- **gitlab** MCP запускается через `npx` → нужен **Node.js** (скрипт ставит
+  standalone-дистрибутив в `~/.local/opt/node`, симлинки в `~/.local/bin`)
+- **jira** MCP запускается через `uvx` → нужен **uv** (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
+- `~/.local/bin` должен быть в PATH юзера и в `Environment=PATH` systemd-юнита
+  worker'а (в эталонном `deploy/ai-assistant-worker.service` уже учтено)
+
+### 4. Проверка
+
+```bash
+claude mcp list
+# jira:   uvx mcp-atlassian==0.21.0 - ✔ Connected
+# gitlab: npx -y @zereight/mcp-gitlab@latest - ✔ Connected
+```
+
+Headless-проверка как это делает worker:
+
+```bash
+cd /path/to/target/repo
+claude -p "Using the gitlab MCP tool get_merge_request fetch MR iid 1 from project group/repo. Reply with the MR title"
+```
+
+### Почему worker не в Docker
+
+Worker сознательно запущен на хосте через systemd: ему нужен прямой доступ к
+файлам целевых репозиториев, `claude` CLI c вашей конфигурацией (`~/.claude*`),
+SSH-ключам и git-кредам для push. В Docker (redis, bot) попадают только
+компоненты без хостовых зависимостей — поэтому перенос на новый стенд = клон
+репо + `install_host_deps.sh` + `cp .env.example .env` + установка systemd-юнита.
 
 ## 📋 Этапы развития
 
@@ -308,12 +363,27 @@ sudo systemctl restart ai-assistant-worker
 2. Проверь очередь в Redis: `redis-cli zcard arq:queue` — если задачи копятся, worker либо упал, либо не подключён к тому же Redis.
 3. Проверь, что бот и worker смотрят на одну БД Redis (одинаковые `REDIS_HOST`/`REDIS_PORT`/`REDIS_DB`). В docker-compose бот использует `REDIS_HOST=redis`, а worker на хосте — `localhost`.
 
+### Claude в ответе пишет «в окружении нет GitLab API-токена» / MCP-инструменты недоступны
+
+Claude Code не подключил MCP-сервер и сделал фолбэк на SSH/git. Типовые причины:
+
+1. **MCP прописаны в `~/.claude/settings.json`** — в Claude Code >= 2.1 эта секция
+   игнорируется. Серверы должны быть в `~/.claude.json` (или через `claude mcp add -s user`).
+   Проверка: `claude mcp list` — должно быть `✔ Connected`.
+2. **Нет Node.js / npx** — gitlab-MCP запускается через `npx`. В чистом PATH
+   systemd-worker'а его может не быть: `env -i PATH="$PATH" npx --version` из-под юнита.
+   Решение: `./deploy/install_host_deps.sh` (ставит Node в `~/.local/opt/node`,
+   который уже есть в PATH юнита).
+3. **Инструмент не в allowlist** — в headless-режиме `dontAsk` вызов `mcp__gitlab__*`
+   без `mcp__gitlab` в `permissions.allow` отклоняется. Добавь `mcp__gitlab`, `mcp__jira`
+   в `~/.claude/settings.json`.
+
 ### Claude Code не отвечает / таймауты
 
 - `which claude` — доступен ли CLI.
 - `claude --version` — работает ли.
 - Проверь таймауты в `.env` (`CLAUDE_TIMEOUT`, `TASK_TIMEOUT`).
-- В целевом проекте должен быть настроен `.claude/settings.json` (см. раздел выше).
+- При таймауте частичный вывод и логи сохраняются в БД — смотри `/task_details <task_id>`.
 
 ### Бот не запускается
 
@@ -340,28 +410,36 @@ MIT
 git clone https://github.com/MikhailTroshin/ai-dev-assistant.git
 cd ai-dev-assistant
 
-# 2. Создай виртуальное окружение (имя каталога — строго .venv!)
+# 2. Установи хостовые зависимости (Claude Code, Node.js, uv, MCP jira/gitlab)
+#    Передай креды Jira/GitLab через env-переменные или введи интерактивно:
+JIRA_URL=... JIRA_USERNAME=... JIRA_API_TOKEN=... \
+GITLAB_API_URL=... GITLAB_PERSONAL_ACCESS_TOKEN=... \
+./deploy/install_host_deps.sh
+#    Затем настрой API-модели в ~/.claude/settings.json (см. раздел
+#    «Конфигурация Claude Code») и проверь: claude mcp list
+
+# 3. Создай виртуальное окружение (имя каталога — строго .venv!)
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# 3. Создай .env файл
-cp .env.example .env  # или создай вручную
-# Заполни: TELEGRAM_BOT_TOKEN, REDIS_HOST, пути к проекту
+# 4. Создай .env файл
+cp .env.example .env
+# Заполни: TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_ID, пути к репо
 
-# 4. Подготовь каталоги и установи права
+# 5. Подготовь каталоги и установи права
 mkdir -p data logs
 sudo chown -R $USER:$USER data logs
 
-# 5. Убедись, что Claude Code установлен и доступен
+# 6. Убедись, что Claude Code установлен и доступен
 claude --version
 which claude  # обычно ~/.local/bin/claude
 
-# 6. Установи и активируй systemd-юнит для worker
+# 7. Установи и активируй systemd-юнит для worker
 sudo cp deploy/ai-assistant-worker.service /etc/systemd/system/
 #    Отредактируй пути внутри файла под своего пользователя!
 sudo systemctl daemon-reload
 sudo systemctl enable ai-assistant-worker
 
-# 7. Запусти систему
+# 8. Запусти систему
 ./start.sh

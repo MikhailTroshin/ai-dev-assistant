@@ -116,11 +116,23 @@ Worker работает как systemd-сервис `ai-assistant-worker`. Эт�
 
 1. Worker запускается от обычного пользователя (владельца каталога проекта),
    НЕ от root. Иначе будет `readonly database` при записи в SQLite.
-2. В `Environment=PATH=...` обязательно включён `~/.local/bin`, где лежит
-   `claude` CLI. Без него будет `[Errno 2] No such file or directory: 'claude'`.
+2. В `Environment=PATH=...` обязательно включён `~/.local/bin`, где лежат
+   `claude` CLI, `node`/`npx` (нужны MCP-серверам) и `uvx`. Без него будет
+   `[Errno 2] No such file or directory: 'claude'`.
 3. Worker запускается через `python3.12 -m arq ...`, а не через скрипт
    `.venv/bin/arq` (shebang которого ломается при перемещении venv).
 4. Виртуальное окружение должно называться **`.venv`** (не `venv`).
+
+### Хостовые зависимости (Claude Code, Node.js, uv, MCP)
+
+Устанавливаются скриптом `deploy/install_host_deps.sh` (идемпотентен):
+- Node.js → `~/.local/opt/node` + симлинки в `~/.local/bin` (для gitlab-MCP через npx)
+- uv/uvx (для jira-MCP через uvx)
+- Claude Code CLI → `~/.local/bin/claude`
+- MCP-серверы jira/gitlab регистрируются в `~/.claude.json` (user scope).
+  ВАЖНО: в Claude Code >= 2.1 `mcpServers` из `~/.claude/settings.json` игнорируется!
+- В `~/.claude/settings.json` добавляются `mcp__jira`/`mcp__gitlab` в permissions.allow
+  (без этого headless-режим dontAsk отклоняет MCP-инструменты).
 
 После изменения `deploy/ai-assistant-worker.service`:
 ```bash
