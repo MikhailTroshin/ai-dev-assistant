@@ -84,7 +84,7 @@ class Settings(BaseSettings):
     
     # Claude Code
     CLAUDE_CODE_PATH: str = "claude"
-    CLAUDE_TIMEOUT: int = 600  # 10 минут
+    CLAUDE_TIMEOUT: int = 1200  # 20 минут
     
     # Database
     DATABASE_URL: str = "sqlite+aiosqlite:///data/assistant.db"
@@ -98,8 +98,8 @@ class Settings(BaseSettings):
     TELEGRAM_ADMIN_ID: int = 0
     
     # Task timeouts
-    TASK_TIMEOUT: int = 900  # 15 минут
-    POLL_INTERVAL: int = 5   # Проверка каждые 5 секунд
+    TASK_TIMEOUT: int = 1200  # 20 минут
+    POLL_INTERVAL: int = 10   # Проверка каждые 10 секунд
     
     class Config:
         env_file = ".env"

@@ -74,7 +74,7 @@ class ClaudeRunner:
             f"cmd: {self.claude_path}",
             f"cwd: {working_dir}",
             f"timeout: {timeout}s",
-            f"prompt ({len(prompt)} chars): {prompt[:200]}{'...' if len(prompt) > 200 else ''}",
+            f"prompt ({len(prompt)} chars): {prompt[:500]}{'...' if len(prompt) > 500 else ''}",
         ]
 
         try:
