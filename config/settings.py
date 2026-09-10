@@ -84,7 +84,24 @@ class Settings(BaseSettings):
     
     # Claude Code
     CLAUDE_CODE_PATH: str = "claude"
-    CLAUDE_TIMEOUT: int = 1200  # 20 минут
+    # Таймаут по умолчанию для одной задачи Claude Code (сек)
+    CLAUDE_TIMEOUT: int = 600  # 10 минут
+    # Таймауты по командам (сек). Разработка/ревью больших MR идут долго,
+    # вопросы — быстро. Внутренний таймаут всегда = значение команды минус
+    # CLAUDE_TIMEOUT_MARGIN (запас, чтобы результат успел сохраниться в
+    # Redis до того, как arq отменит джобу).
+    COMMAND_TIMEOUTS: dict[str, int] = Field(
+        default={
+            "ask": 600,
+            "task": 3600,        # разработка по Jira-задаче — до часа
+            "bug": 1800,
+            "code-review": 1800,
+            "rebase": 1800,
+        }
+    )
+    # Запас между внутренним таймаутом Claude и таймаутом arq-джобы (сек):
+    # за это время результат должен успеть записаться в БД и Redis
+    CLAUDE_TIMEOUT_MARGIN: int = 60
     
     # Database
     DATABASE_URL: str = "sqlite+aiosqlite:///data/assistant.db"
@@ -98,8 +115,20 @@ class Settings(BaseSettings):
     TELEGRAM_ADMIN_ID: int = 0
     
     # Task timeouts
-    TASK_TIMEOUT: int = 1200  # 20 минут
-    POLL_INTERVAL: int = 10   # Проверка каждые 10 секунд
+    TASK_TIMEOUT: int = 3900  # верхняя граница arq для любой задачи (макс. command timeout + margin)
+    POLL_INTERVAL: int = 5   # Проверка каждые 5 секунд
+
+
+def get_command_timeout(command: str | None) -> int:
+    """Таймаут Claude-запуска для команды (task=1ч, ask=10мин и т.д.)."""
+    if command and command in settings.COMMAND_TIMEOUTS:
+        return settings.COMMAND_TIMEOUTS[command]
+    return settings.CLAUDE_TIMEOUT
+
+
+def get_job_timeout(command: str | None) -> int:
+    """Таймаут arq-джобы: внутренний таймаут + запас на сохранение результата."""
+    return get_command_timeout(command) + settings.CLAUDE_TIMEOUT_MARGIN
     
     class Config:
         env_file = ".env"

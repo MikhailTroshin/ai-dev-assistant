@@ -29,6 +29,7 @@ class TaskRecord(Base):
     tokens_used = Column(Integer, nullable=True)
     project = Column(String(100), nullable=True)  # имя проекта из реестра PROJECTS
     logs = Column(Text, nullable=True)  # технический лог выполнения (диагностика ошибок)
+    notified = Column(Boolean, default=False, nullable=False)  # отправлено ли уведомление о потере задачи
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
     
@@ -63,6 +64,9 @@ class Database:
             if "logs" not in existing:
                 await conn.execute(text("ALTER TABLE tasks ADD COLUMN logs TEXT"))
                 logger.info("Миграция: добавлена колонка tasks.logs")
+            if "notified" not in existing:
+                await conn.execute(text("ALTER TABLE tasks ADD COLUMN notified BOOLEAN DEFAULT 0 NOT NULL"))
+                logger.info("Миграция: добавлена колонка tasks.notified")
         logger.info("База данных инициализирована")
     
     async def save_task(self, task_data: dict) -> TaskRecord:
@@ -112,6 +116,34 @@ class Database:
                 .limit(limit)
             )
             return result.scalars().all()
+
+    async def get_stale_tasks(self, cutoff: datetime, limit: int = 10) -> List[TaskRecord]:
+        """
+        Незавершённые задачи (completed_at IS NULL), созданные раньше cutoff
+        и ещё не помеченные уведомлёнными. Бот использует это для детекта
+        потерянных задач (worker упал до сохранения результата).
+        """
+        async with self.async_session() as session:
+            from sqlalchemy import select
+            result = await session.execute(
+                select(TaskRecord)
+                .where(
+                    TaskRecord.completed_at.is_(None),
+                    TaskRecord.created_at < cutoff,
+                    TaskRecord.notified.is_(False),
+                )
+                .order_by(TaskRecord.created_at.asc())
+                .limit(limit)
+            )
+            return result.scalars().all()
+
+    async def mark_task_notified(self, task_id: str, error: Optional[str] = None) -> None:
+        """Пометить задачу как уведомлённую (защита от повторных сообщений о потере)."""
+        update_data = {"notified": True}
+        if error:
+            update_data["error"] = error
+            update_data["success"] = False
+        await self.update_task(task_id, update_data)
     
     async def get_stats(self) -> dict:
         """Получить статистику"""

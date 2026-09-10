@@ -6,16 +6,21 @@ echo "📊 Статус AI Assistant"
 echo ""
 
 echo "⚙️ Worker:"
-if systemctl list-unit-files 2>/dev/null | grep -q '^ai-assistant-worker.service'; then
-    # systemd нужен sudo для статуса; если нет прав — показываем подсказку
-    if sudo -n true 2>/dev/null; then
-        systemctl status ai-assistant-worker --no-pager -l | head -n 15
-    else
-        echo "   (для подробного статуса выполните: sudo systemctl status ai-assistant-worker)"
-        systemctl is-active ai-assistant-worker 2>/dev/null || true
+if systemctl cat ai-assistant-worker >/dev/null 2>&1; then
+    state=$(systemctl is-active ai-assistant-worker 2>/dev/null || echo unknown)
+    echo "   Юнит установлен. Состояние: ${state}"
+    if [ "$state" != "active" ]; then
+        echo "   ⚠️  Worker не активен! Логи:"
+        tail -n 5 logs/worker.log 2>/dev/null || true
+        echo "   Подсказка: sudo systemctl restart ai-assistant-worker"
+    fi
+    # Хвост лога для живого воркера
+    if [ "$state" = "active" ]; then
+        echo "   Последнее событие: $(grep -E 'ПОЛУЧЕНА ЗАДАЧА|завершена|ERROR' logs/worker.log 2>/dev/null | tail -1)"
     fi
 else
     echo "   ⚠️  Юнит ai-assistant-worker не установлен в systemd."
+    echo "      Установи: sudo cp deploy/ai-assistant-worker.service /etc/systemd/system/ && sudo systemctl daemon-reload"
 fi
 
 echo ""
