@@ -12,7 +12,7 @@ from arq.connections import RedisSettings
 
 from config.settings import settings, get_job_timeout
 from src.core.database import db
-from src.bot.handlers import router, send_long_message, set_redis_pool
+from src.bot.handlers import router, send_long_message, set_redis_pool, get_reply_keyboard
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,8 +60,23 @@ async def check_results(bot: Bot, redis_client: redis.Redis):
                                 if result.get("timed_out") and partial:
                                     text += f"\n\n⚠️ Частичный вывод:\n{partial[:1500]}"
 
+                            # Кнопка «Ответить» — если есть сессия Claude Code,
+                            # диалог можно продолжить (клод помнит контекст)
+                            reply_markup = None
+                            if result.get("session_id"):
+                                reply_markup = get_reply_keyboard(task_id)
+
                             # Используем send_long_message с bot
                             await send_long_message(bot, text, chat_id=chat_id)
+                            if reply_markup:
+                                try:
+                                    await bot.send_message(
+                                        chat_id,
+                                        "💬 Можно продолжить диалог — Claude помнит контекст задачи.",
+                                        reply_markup=reply_markup,
+                                    )
+                                except Exception as e:
+                                    logger.error(f"Не удалось показать кнопку ответа: {e}")
                             
                             # Удаляем из очереди
                             await redis_client.srem("pending_results", task_id)

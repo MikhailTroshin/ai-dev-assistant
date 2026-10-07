@@ -30,6 +30,7 @@ class TaskRecord(Base):
     project = Column(String(100), nullable=True)  # имя проекта из реестра PROJECTS
     logs = Column(Text, nullable=True)  # технический лог выполнения (диагностика ошибок)
     notified = Column(Boolean, default=False, nullable=False)  # отправлено ли уведомление о потере задачи
+    session_id = Column(String(64), nullable=True, index=True)  # ID сессии Claude Code (для диалогов --resume)
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
     
@@ -67,6 +68,9 @@ class Database:
             if "notified" not in existing:
                 await conn.execute(text("ALTER TABLE tasks ADD COLUMN notified BOOLEAN DEFAULT 0 NOT NULL"))
                 logger.info("Миграция: добавлена колонка tasks.notified")
+            if "session_id" not in existing:
+                await conn.execute(text("ALTER TABLE tasks ADD COLUMN session_id VARCHAR(64)"))
+                logger.info("Миграция: добавлена колонка tasks.session_id")
         logger.info("База данных инициализирована")
     
     async def save_task(self, task_data: dict) -> TaskRecord:

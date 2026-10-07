@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -50,20 +51,27 @@ class ClaudeRunner:
         self,
         prompt: str,
         working_dir: Optional[Path] = None,
-        timeout: Optional[int] = None
+        timeout: Optional[int] = None,
+        resume_session_id: Optional[str] = None,
     ) -> dict:
         """
         Запускает Claude Code с промптом.
 
+        Args:
+            resume_session_id: ID сессии Claude Code для продолжения диалога
+                (--resume). Тогда новый промпт выполняется в контексте
+                предыдущего разговора (файлы, решения, открытые вопросы).
+
         Возвращает:
             {
                 "success": bool,
-                "output": str,       # stdout (или частичный при таймауте)
+                "output": str,       # текст ответа (или частичный при таймауте)
                 "error": str | None, # человекочитаемое описание ошибки
                 "returncode": int,
                 "logs": str,         # технический лог выполнения для отладки
                 "timed_out": bool,
-                "duration": float
+                "duration": float,
+                "session_id": str | None,  # ID сессии для --resume (диалоги)
             }
         """
         timeout = timeout or settings.CLAUDE_TIMEOUT
@@ -74,11 +82,14 @@ class ClaudeRunner:
             f"cmd: {self.claude_path}",
             f"cwd: {working_dir}",
             f"timeout: {timeout}s",
+            f"resume_session: {resume_session_id or '-'}",
             f"prompt ({len(prompt)} chars): {prompt[:500]}{'...' if len(prompt) > 500 else ''}",
         ]
 
         try:
-            cmd = [self.claude_path, prompt]
+            cmd = [self.claude_path, prompt, "--output-format", "json"]
+            if resume_session_id:
+                cmd += ["--resume", resume_session_id]
 
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -108,14 +119,29 @@ class ClaudeRunner:
                 await collector.stop()
 
                 duration = time.monotonic() - started
-                output = collector.stdout.strip()
+                raw_output = collector.stdout.strip()
                 error_out = collector.stderr.strip()
                 success = process.returncode == 0
 
                 log_lines.append(f"finished: rc={process.returncode}, duration={duration:.1f}s")
-                log_lines.append(f"stdout ({len(output)} chars)")
+                log_lines.append(f"stdout ({len(raw_output)} chars)")
                 if error_out:
                     log_lines.append(f"stderr: {error_out[:2000]}")
+
+                # JSON-режим: извлекаем чистый ответ и session_id для диалогов
+                output = raw_output
+                session_id = resume_session_id
+                if success:
+                    try:
+                        data = json.loads(raw_output)
+                        output = (data.get("result") or "").strip()
+                        session_id = data.get("session_id") or session_id
+                        if data.get("is_error"):
+                            success = False
+                            error_out = output or "Claude Code вернул is_error"
+                    except json.JSONDecodeError:
+                        # Не JSON (например, предупреждения вперемешку) — оставляем как есть
+                        log_lines.append("stdout не является JSON, использую как есть")
 
                 return {
                     "success": success,
@@ -125,12 +151,16 @@ class ClaudeRunner:
                     "logs": "\n".join(log_lines),
                     "timed_out": False,
                     "duration": duration,
+                    "session_id": session_id,
                 }
 
             # --- Таймаут ---
             # Забираем частичный вывод ДО убийства процесса
             partial_out = collector.stdout
             partial_err = collector.stderr
+            # Сессия могла быть создана до таймаута: JSON обычно не дописан,
+            # но при resume сессия уже существует — пробуем достать ID из обрывка
+            session_id = resume_session_id or self._extract_session_id(partial_out)
             # Убиваем всю группу процессов (start_new_session=True => pgid == pid):
             # иначе выжившие дети держат пайпы открытыми и wait() зависает
             try:
@@ -166,6 +196,7 @@ class ClaudeRunner:
                 "logs": "\n".join(log_lines),
                 "timed_out": True,
                 "duration": duration,
+                "session_id": session_id,
             }
 
         except Exception as e:
@@ -180,7 +211,19 @@ class ClaudeRunner:
                 "logs": "\n".join(log_lines),
                 "timed_out": False,
                 "duration": duration,
+                "session_id": resume_session_id,
             }
+
+    @staticmethod
+    def _extract_session_id(partial_output: str) -> Optional[str]:
+        """
+        Пытается достать session_id из частичного/битого JSON-вывода.
+        Claude Code печатает JSON одним куском в конце, но session_id
+        встречается и в стриминговых обрывках.
+        """
+        import re
+        m = re.search(r'"session_id"\s*:\s*"([0-9a-f-]{36})"', partial_output)
+        return m.group(1) if m else None
 
 
 claude_runner = ClaudeRunner()

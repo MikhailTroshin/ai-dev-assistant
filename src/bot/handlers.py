@@ -54,6 +54,11 @@ class ContextStates(StatesGroup):
     waiting_for_context = State()
 
 
+class ReplyStates(StatesGroup):
+    """Состояния флоу ответа в диалоге с Claude (--resume сессии)"""
+    waiting_for_reply = State()
+
+
 class DetailsStates(StatesGroup):
     """Состояния для команды /task_details"""
     waiting_for_task_id = State()
@@ -298,18 +303,26 @@ async def set_user_project(user_id: int, project: str) -> None:
         await redis_client.close()
 
 
-async def _submit_prompt(message: Message, command: str, prompt: str, redis_pool=None):
+async def _submit_prompt(
+    message: Message,
+    command: str,
+    prompt: str,
+    redis_pool=None,
+    resume_session_id: str = None,
+    project: str = None,
+):
     """Постановка задачи в очередь с готовым промптом (общая для всех команд)."""
     redis_pool = redis_pool or _RedisPoolHolder.pool
     user_id = message.from_user.id
     chat_id = message.chat.id
     task_id = f"{command}_{user_id}_{message.message_id}"
-    project = await get_user_project(user_id)
+    project = project or await get_user_project(user_id)
 
+    reply_note = "\n💬 Продолжение диалога" if resume_session_id else ""
     await message.answer(
         f"⏳ Задача принята!\n"
         f"ID: `{task_id}`\n"
-        f"🗂 Проект: `{project}`\n\n"
+        f"🗂 Проект: `{project}`{reply_note}\n\n"
         f"Сообщу, когда будет готово (может занять до 10 минут)",
         parse_mode="Markdown",
     )
@@ -323,6 +336,7 @@ async def _submit_prompt(message: Message, command: str, prompt: str, redis_pool
         user_id=user_id,
         command=command,
         project=project,
+        resume_session_id=resume_session_id,
     )
 
     await save_task_mapping(task_id, chat_id, user_id)
@@ -748,6 +762,79 @@ async def _submit_rebase(message: Message, branches: str, redis_pool=None):
     """
 
     await _submit_prompt(message, "rebase", prompt, redis_pool)
+
+
+# ==================== Флоу ответа в диалоге (resume сессии Claude) ====================
+
+CB_REPLY_PREFIX = "reply:"
+
+
+def get_reply_keyboard(task_id: str) -> InlineKeyboardMarkup:
+    """Inline-кнопка «Ответить» под результатом задачи."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💬 Ответить (продолжить диалог)", callback_data=CB_REPLY_PREFIX + task_id)],
+        ]
+    )
+
+
+@router.callback_query(F.data.startswith(CB_REPLY_PREFIX))
+async def cb_reply(callback: CallbackQuery, state: FSMContext):
+    """Пользователь нажал «Ответить» — ждём сообщение для продолжения диалога."""
+    await callback.answer()
+    task_id = callback.data[len(CB_REPLY_PREFIX):]
+
+    # Сессию берём из БД (живёт столько же, сколько запись о задаче)
+    task = await db.get_task(task_id)
+    if not task or not task.session_id:
+        await callback.message.answer(
+            "❌ Сессия не найдена (устарела или задача без сессии). "
+            "Начни новую команду.",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+    # Проверка доступа
+    if task.user_id != callback.from_user.id and callback.from_user.id != settings.TELEGRAM_ADMIN_ID:
+        await callback.message.answer("⛔ У тебя нет доступа к этому диалогу")
+        return
+
+    await state.set_state(ReplyStates.waiting_for_reply)
+    await state.update_data(reply_task_id=task_id, reply_session_id=task.session_id)
+    await callback.message.answer(
+        "💬 Напиши ответ для Claude — он продолжит работу в контексте этой задачи "
+        "(помнит файлы, решения и свой последний вопрос).\n\n"
+        "Напиши «отмена», чтобы прервать.",
+    )
+
+
+@router.message(ReplyStates.waiting_for_reply, F.text)
+async def process_reply_text(message: Message, state: FSMContext, redis_pool):
+    """Отправка ответа пользователя в сессию Claude (--resume)."""
+    data = await state.get_data()
+    task_id = data.get("reply_task_id")
+    session_id = data.get("reply_session_id")
+    if not task_id or not session_id:
+        await state.clear()
+        await message.answer("❌ Контекст диалога потерян. Начни новую команду.", reply_markup=get_main_keyboard())
+        return
+
+    text = message.text.strip()
+    if text.lower() in ("отмена", "cancel"):
+        await state.clear()
+        await message.answer("❌ Ответ отменён.", reply_markup=get_main_keyboard())
+        return
+
+    # Берём проект исходной задачи — диалог продолжается в том же репо
+    task = await db.get_task(task_id)
+    project = task.project if task and task.project else get_default_project()
+
+    await state.clear()
+    await _submit_prompt(
+        message, "reply", text,
+        redis_pool,
+        resume_session_id=session_id,
+        project=project,
+    )
 
 
 # ==================== /project (выбор активного репозитория) ====================

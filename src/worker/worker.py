@@ -89,9 +89,14 @@ async def process_task(
     command: Optional[str] = None,
     project: Optional[str] = None,
     extra_projects: Optional[list[str]] = None,
+    resume_session_id: Optional[str] = None,
 ) -> dict:
     """
     Обработчик задач из очереди.
+
+    resume_session_id: если передан, Claude Code продолжает существующий
+    диалог (--resume) — пользователь может отвечать на вопросы ассистента
+    через кнопку «Ответить» в ТГ.
 
     Таймаут-схема (надёжность уведомлений):
     - arq ограничивает джобу значением TASK_TIMEOUT (максимум для любой команды);
@@ -132,12 +137,14 @@ async def process_task(
 
     # Запускаем Claude Code. Любая ошибка (включая отмену от arq) попадает
     # в _save_failure — пользователь получит уведомление в ТГ, а не тишину.
-    logger.info(f"Запускаем Claude Code в {work_dir} (timeout={claude_timeout}s)...")
+    logger.info(f"Запускаем Claude Code в {work_dir} (timeout={claude_timeout}s"
+                f"{f', resume={resume_session_id[:8]}…' if resume_session_id else ''})...")
     try:
         result = await claude_runner.run(
             prompt=full_prompt,
             working_dir=work_dir,
             timeout=claude_timeout,
+            resume_session_id=resume_session_id,
         )
     except asyncio.CancelledError:
         # Джобу отменил arq (job_timeout) или воркер останавливается.
@@ -183,6 +190,7 @@ async def process_task(
         "duration_seconds": duration,
         "completed_at": end_time,
         "logs": full_logs,
+        "session_id": result.get("session_id"),
     })
     
     logger.info(f"✅ Задача {task_id} завершена за {duration:.2f}с")
@@ -203,6 +211,9 @@ async def process_task(
                 "error": result.get("error"),
                 "timed_out": result.get("timed_out", False),
                 "task_id": task_id,
+                "session_id": result.get("session_id"),
+                "command": command,
+                "project": project,
             })
         )
         
