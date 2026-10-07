@@ -180,9 +180,14 @@ async def main():
         f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}"
     )
     
-    # Создаём хранилище для FSM
+    # Создаём хранилище для FSM.
+    # state_ttl/data_ttl: незавершённые состояния сами истекают через час,
+    # иначе пользователь навсегда «застревает» в сценарии (например, после
+    # перезапуска бота или проигнорированных inline-кнопок).
     storage = RedisStorage.from_url(
-        f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}"
+        f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}",
+        state_ttl=3600,
+        data_ttl=3600,
     )
     
     # Создаём диспетчер

@@ -268,6 +268,21 @@ async def process_context_text(message: Message, state: FSMContext, redis_pool):
     """Получено сообщение с доп. контекстом — отправляем задачу с ним."""
     data = await state.get_data()
     if not data.get("ctx_awaiting_text"):
+        # Пользователь пишет текст, не нажав ни одну inline-кнопку.
+        # Молчать нельзя — иначе бот выглядит «зависшим». Подсказываем кнопки.
+        command = data.get("ctx_command")
+        if not command:
+            await state.clear()
+            await message.answer(
+                "❌ Контекст диалога потерян. Выбери команду на клавиатуре.",
+                reply_markup=get_main_keyboard(),
+            )
+            return
+        await message.answer(
+            "💡 Сначала нажми кнопку под моим прошлым сообщением: "
+            "«➕ Добавить контекст» или «🚀 Отправить как есть».\n\n"
+            "Или напиши «отмена», чтобы прервать.",
+        )
         return
     command = data.get("ctx_command")
     prompt = data.get("ctx_prompt", "")
