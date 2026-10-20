@@ -10,6 +10,7 @@ from aiogram.fsm.state import State, StatesGroup
 import redis.asyncio as redis
 
 from src.core.database import db
+from src.core.jira_key import extract_jira_key
 from config.settings import settings, get_project_path, get_default_project
 
 logger = logging.getLogger(__name__)
@@ -74,6 +75,7 @@ BUTTON_ALIASES: dict[str, str] = {
     "🐛 Баг": "bug",
     "🔍 Code Review": "code-review",
     "🔧 Rebase": "rebase",
+    "↩️ Продолжить работу": "continue",
     "📜 История": "history",
     "📈 Статистика": "stats",
     "🔎 Детали задачи": "task_details",
@@ -91,12 +93,13 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="❓ Вопрос"), KeyboardButton(text="📋 Задача Jira")],
             [KeyboardButton(text="🐛 Баг"), KeyboardButton(text="🔍 Code Review")],
-            [KeyboardButton(text="🔧 Rebase"), KeyboardButton(text="🗂 Сменить проект")],
+            [KeyboardButton(text="🔧 Rebase"), KeyboardButton(text="↩️ Продолжить работу")],
+            [KeyboardButton(text="🗂 Сменить проект"), KeyboardButton(text="📜 История")],
             [
-                KeyboardButton(text="📜 История"),
                 KeyboardButton(text="📈 Статистика"),
+                KeyboardButton(text="📊 Статус"),
             ],
-            [KeyboardButton(text="🔎 Детали задачи"), KeyboardButton(text="📊 Статус")],
+            [KeyboardButton(text="🔎 Детали задачи")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -325,6 +328,8 @@ async def _submit_prompt(
     redis_pool=None,
     resume_session_id: str = None,
     project: str = None,
+    jira_key: str = None,
+    parent_task_id: str = None,
 ):
     """Постановка задачи в очередь с готовым промптом (общая для всех команд)."""
     redis_pool = redis_pool or _RedisPoolHolder.pool
@@ -332,12 +337,15 @@ async def _submit_prompt(
     chat_id = message.chat.id
     task_id = f"{command}_{user_id}_{message.message_id}"
     project = project or await get_user_project(user_id)
+    # Идентификатор Jira-задачи: явный (унаследованный от диалога) или из промпта
+    jira_key = jira_key or extract_jira_key(prompt)
 
+    key_note = f"\n🔖 Jira: `{jira_key}`" if jira_key else ""
     reply_note = "\n💬 Продолжение диалога" if resume_session_id else ""
     await message.answer(
         f"⏳ Задача принята!\n"
         f"ID: `{task_id}`\n"
-        f"🗂 Проект: `{project}`{reply_note}\n\n"
+        f"🗂 Проект: `{project}`{key_note}{reply_note}\n\n"
         f"Сообщу, когда будет готово (может занять до 10 минут)",
         parse_mode="Markdown",
     )
@@ -352,6 +360,8 @@ async def _submit_prompt(
         command=command,
         project=project,
         resume_session_id=resume_session_id,
+        jira_key=jira_key,
+        parent_task_id=parent_task_id,
     )
 
     await save_task_mapping(task_id, chat_id, user_id)
@@ -433,6 +443,8 @@ async def handle_button(message: Message, state: FSMContext):
         await _enter_details(message, state)
     elif command == "project":
         await _enter_project(message, state)
+    elif command == "continue":
+        await show_continue_menu(message)
     elif command == "history":
         await cmd_history(message)
     elif command == "stats":
@@ -839,9 +851,15 @@ async def process_reply_text(message: Message, state: FSMContext, redis_pool):
         await message.answer("❌ Ответ отменён.", reply_markup=get_main_keyboard())
         return
 
-    # Берём проект исходной задачи — диалог продолжается в том же репо
+    # Берём проект исходной задачи — диалог продолжается в том же репо,
+    # jira_key наследуем для сквозной идентификации в меню и сообщениях,
+    # parent_task_id — чтобы весь диалог считался одной задачей в меню
     task = await db.get_task(task_id)
     project = task.project if task and task.project else get_default_project()
+    jira_key = task.jira_key if task else None
+    # Корень диалога: если у исходной задачи есть родитель — он и есть корень,
+    # иначе исходная задача сама корень (это первый запрос диалога)
+    parent_task_id = (task.parent_task_id or task.task_id) if task else None
 
     await state.clear()
     await _submit_prompt(
@@ -849,6 +867,105 @@ async def process_reply_text(message: Message, state: FSMContext, redis_pool):
         redis_pool,
         resume_session_id=session_id,
         project=project,
+        jira_key=jira_key,
+        parent_task_id=parent_task_id,
+    )
+
+
+# ==================== Меню «Продолжить работу» ====================
+
+CB_CONTINUE_PREFIX = "cont:"
+
+# Сколько последних задач показывать в меню
+CONTINUE_MENU_LIMIT = 10
+
+# Человекочитаемые подписи команд для кнопок
+COMMAND_LABELS = {
+    "ask": "вопрос",
+    "task": "Jira",
+    "bug": "баг",
+    "code-review": "ревью",
+    "rebase": "rebase",
+    "reply": "диалог",
+}
+
+# Максимальная длина названия задачи на кнопке (Telegram ограничивает 64 симв.)
+_SUMMARY_MAX_LEN = 25
+
+
+def _continue_button_label(task) -> str:
+    """
+    Подпись кнопки меню. С названием Jira-задачи:
+    'AA-920 · рефреш реранкера · ревью · 13.10', без — 'вопрос · 06.10'.
+    """
+    date_part = task.created_at.strftime("%d.%m") if task.created_at else ""
+    cmd_part = COMMAND_LABELS.get(task.command, task.command or "задача")
+    if task.jira_key:
+        parts = [task.jira_key]
+        if task.jira_summary:
+            summary = task.jira_summary
+            if len(summary) > _SUMMARY_MAX_LEN:
+                summary = summary[:_SUMMARY_MAX_LEN - 1].rstrip() + "…"
+            parts.append(summary)
+        parts.append(cmd_part)
+        if date_part:
+            parts.append(date_part)
+        return f"🔖 {' · '.join(parts)}"
+    return f"{cmd_part} · {date_part}" if date_part else cmd_part
+
+
+async def show_continue_menu(message: Message):
+    """Показывает inline-меню последних задач для продолжения диалога."""
+    tasks = await db.get_recent_resumable_tasks(message.from_user.id, limit=CONTINUE_MENU_LIMIT)
+
+    if not tasks:
+        await message.answer(
+            "📭 Пока нет задач, которые можно продолжить.\n\n"
+            "Заверши любую команду — после первого результата здесь появится "
+            "её сессия.",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+
+    buttons = [
+        [InlineKeyboardButton(
+            text=_continue_button_label(task),
+            callback_data=CB_CONTINUE_PREFIX + task.task_id,
+        )]
+        for task in tasks
+    ]
+    await message.answer(
+        "↩️ Выбери задачу, чтобы продолжить диалог с Claude "
+        "(он помнит контекст: файлы, решения, открытые вопросы):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.callback_query(F.data.startswith(CB_CONTINUE_PREFIX))
+async def cb_continue_task(callback: CallbackQuery, state: FSMContext):
+    """Пользователь выбрал задачу из меню — входим в флоу ответа (resume)."""
+    await callback.answer()
+    task_id = callback.data[len(CB_CONTINUE_PREFIX):]
+
+    task = await db.get_task(task_id)
+    if not task or not task.session_id:
+        await callback.message.answer(
+            "❌ Сессия не найдена (устарела или задача без сессии). Начни новую команду.",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+    # Проверка доступа
+    if task.user_id != callback.from_user.id and callback.from_user.id != settings.TELEGRAM_ADMIN_ID:
+        await callback.message.answer("⛔ У тебя нет доступа к этому диалогу")
+        return
+
+    key_note = f" (🔖 {task.jira_key})" if task.jira_key else ""
+    await state.set_state(ReplyStates.waiting_for_reply)
+    await state.update_data(reply_task_id=task.task_id, reply_session_id=task.session_id)
+    await callback.message.answer(
+        f"💬 Задача выбрана{key_note}. Напиши, что сделать дальше — Claude "
+        "продолжит работу в контексте этой задачи.\n\n"
+        "Напиши «отмена», чтобы прервать.",
     )
 
 
@@ -1024,6 +1141,7 @@ async def _show_task_details(message: Message, task_id: str):
 
     📌 Команда: {task.command}
     🗂 Проект: {task.project or 'N/A'}
+    🔖 Jira: {task.jira_key or '—'}
     {'✅ Успешно' if task.success else '❌ Ошибка'}
 ⏱ Время: {task.duration_seconds:.2f}с
 📅 Создана: {task.created_at.strftime('%d.%m.%Y %H:%M')}

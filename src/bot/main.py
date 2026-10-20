@@ -46,11 +46,13 @@ async def check_results(bot: Bot, redis_client: redis.Redis):
                         
                         # Отправляем результат
                         try:
+                            # Заголовок: номер Jira-задачи, если запрос к ней относился
+                            key_part = f"[{result['jira_key']}] " if result.get("jira_key") else ""
                             if result['success']:
-                                text = f"✅ Результат:\n\n{result['output']}"
+                                text = f"✅ {key_part}Результат:\n\n{result['output']}"
                             else:
                                 text = (
-                                    f"❌ Ошибка в задаче `{result.get('task_id', task_id)}`:\n\n"
+                                    f"❌ {key_part}Ошибка в задаче `{result.get('task_id', task_id)}`:\n\n"
                                     f"{result.get('error') or 'Неизвестная ошибка (нет описания)'}\n\n"
                                     f"📖 Подробности и логи: `/task_details {result.get('task_id', task_id)}`"
                                 )

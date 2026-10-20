@@ -13,6 +13,7 @@ from arq.worker import func
 
 from src.core.claude_runner import claude_runner
 from src.core.database import db
+from src.core.jira_summary import fetch_jira_summary
 from src.core.project_context import build_repo_context
 from config.settings import settings, get_project_path, get_default_project, get_command_timeout
 
@@ -79,6 +80,33 @@ async def _save_failure(
     return result
 
 
+async def _enrich_jira_summaries() -> None:
+    """
+    Фоновое обогащение: подтягивает название Jira-задачи (summary) для записей,
+    у которых есть jira_key, но ещё нет jira_summary (в т.ч. исторические).
+    Ошибки не критичны — в следующий раз попробует снова.
+    """
+    try:
+        tasks = await db.get_tasks_missing_jira_summary(limit=20)
+    except Exception as e:
+        logger.warning(f"Не удалось получить задачи для обогащения summary: {e}")
+        return
+    if not tasks:
+        return
+
+    redis_client = redis.from_url(
+        f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}"
+    )
+    try:
+        for task in tasks:
+            summary = await fetch_jira_summary(task.jira_key, redis_client)
+            if summary:
+                await db.update_task(task.task_id, {"jira_summary": summary[:250]})
+                logger.info(f"jira_summary обновлён для {task.task_id} ({task.jira_key})")
+    finally:
+        await redis_client.close()
+
+
 async def process_task(
     ctx: dict,
     task_id: str,
@@ -90,6 +118,8 @@ async def process_task(
     project: Optional[str] = None,
     extra_projects: Optional[list[str]] = None,
     resume_session_id: Optional[str] = None,
+    jira_key: Optional[str] = None,
+    parent_task_id: Optional[str] = None,
 ) -> dict:
     """
     Обработчик задач из очереди.
@@ -97,6 +127,11 @@ async def process_task(
     resume_session_id: если передан, Claude Code продолжает существующий
     диалог (--resume) — пользователь может отвечать на вопросы ассистента
     через кнопку «Ответить» в ТГ.
+    jira_key: ключ Jira-задачи (AA-123), если запрос относится к ней.
+    Используется как человекочитаемый идентификатор в ТГ-интерфейсе.
+    parent_task_id: task_id корневой задачи диалога. Все сообщения одной
+    диалоговой цепочки ссылаются на один корень — так в меню «Продолжить
+    работу» диалог отображается одной кнопкой, а не отдельной на каждый ответ.
 
     Таймаут-схема (надёжность уведомлений):
     - arq ограничивает джобу значением TASK_TIMEOUT (максимум для любой команды);
@@ -106,7 +141,10 @@ async def process_task(
       сохранить его в БД/Redis ДО отмены джобы — пользователь получает
       уведомление в ТГ вместо тишины.
     """
-    logger.info(f"🚀 ПОЛУЧЕНА ЗАДАЧА {task_id} (project={project}, extra={extra_projects})")
+    logger.info(
+        f"🚀 ПОЛУЧЕНА ЗАДАЧА {task_id} (project={project}, extra={extra_projects}, "
+        f"parent={parent_task_id})"
+    )
     logger.info(f"Промпт: {prompt[:100]}...")
 
     start_time = datetime.now()
@@ -132,8 +170,14 @@ async def process_task(
         "error": None,
         "duration_seconds": 0,
         "project": project,
+        "jira_key": jira_key,
+        "parent_task_id": parent_task_id,
         "created_at": start_time
     })
+
+    # Обогащаем названия Jira-задач в фоне (не замедляет выполнение задачи):
+    # тянет summary и для этой записи, и для исторических без jira_summary.
+    enrich_task = asyncio.create_task(_enrich_jira_summaries())
 
     # Запускаем Claude Code. Любая ошибка (включая отмену от arq) попадает
     # в _save_failure — пользователь получит уведомление в ТГ, а не тишину.
@@ -194,7 +238,13 @@ async def process_task(
     })
     
     logger.info(f"✅ Задача {task_id} завершена за {duration:.2f}с")
-    
+
+    # Даём фоновой задаче обогащения завершиться (она быстрая, ошибки глотает)
+    try:
+        await asyncio.wait_for(enrich_task, timeout=15)
+    except (asyncio.TimeoutError, Exception):
+        enrich_task.cancel()
+
     # Сохраняем результат в Redis для бота
     if chat_id:
         redis_client = redis.from_url(
@@ -214,6 +264,7 @@ async def process_task(
                 "session_id": result.get("session_id"),
                 "command": command,
                 "project": project,
+                "jira_key": jira_key,
             })
         )
         

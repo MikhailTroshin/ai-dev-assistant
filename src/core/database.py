@@ -31,6 +31,9 @@ class TaskRecord(Base):
     logs = Column(Text, nullable=True)  # технический лог выполнения (диагностика ошибок)
     notified = Column(Boolean, default=False, nullable=False)  # отправлено ли уведомление о потере задачи
     session_id = Column(String(64), nullable=True, index=True)  # ID сессии Claude Code (для диалогов --resume)
+    jira_key = Column(String(20), nullable=True, index=True)  # ключ Jira-задачи (AA-123), если запрос относится к ней
+    parent_task_id = Column(String(255), nullable=True, index=True)  # task_id корневой задачи диалога (для reply-продолжений)
+    jira_summary = Column(String(255), nullable=True)  # название Jira-задачи (для отображения на кнопках меню)
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
     
@@ -71,7 +74,70 @@ class Database:
             if "session_id" not in existing:
                 await conn.execute(text("ALTER TABLE tasks ADD COLUMN session_id VARCHAR(64)"))
                 logger.info("Миграция: добавлена колонка tasks.session_id")
+            if "jira_key" not in existing:
+                await conn.execute(text("ALTER TABLE tasks ADD COLUMN jira_key VARCHAR(20)"))
+                logger.info("Миграция: добавлена колонка tasks.jira_key")
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_jira_key ON tasks (jira_key)"))
+            if "parent_task_id" not in existing:
+                await conn.execute(text("ALTER TABLE tasks ADD COLUMN parent_task_id VARCHAR(255)"))
+                logger.info("Миграция: добавлена колонка tasks.parent_task_id")
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_parent_task_id ON tasks (parent_task_id)"))
+            if "jira_summary" not in existing:
+                await conn.execute(text("ALTER TABLE tasks ADD COLUMN jira_summary VARCHAR(255)"))
+                logger.info("Миграция: добавлена колонка tasks.jira_summary")
+        await self._backfill_dialog_roots()
         logger.info("База данных инициализирована")
+
+    async def _backfill_dialog_roots(self) -> None:
+        """
+        Разовая миграция данных: старые reply-задачи не имели parent_task_id.
+        Все записи одной диалоговой цепочки делят один session_id — корнем
+        назначаем самую раннюю задачу с этим session_id (её parent = сам корень).
+        """
+        async with self.async_session() as session:
+            from sqlalchemy import select
+            result = await session.execute(
+                select(TaskRecord).where(TaskRecord.parent_task_id.is_(None))
+            )
+            orphans = result.scalars().all()
+            if not orphans:
+                return
+
+            # Группируем сирот по session_id
+            by_session: dict[str, list[TaskRecord]] = {}
+            for task in orphans:
+                if task.session_id:
+                    by_session.setdefault(task.session_id, []).append(task)
+
+            updated = 0
+            for session_id, group in by_session.items():
+                # Корень — самая ранняя задача цепочки; все её элементы (включая
+                # записи без jira_key) наследуют её parent_task_id и jira_key
+                root = min(group, key=lambda t: t.created_at)
+                updates = []
+                if session_id in {t.session_id for t in group}:
+                    # Вся цепочка: все задачи с этим session_id, не только сироты
+                    pass
+                chain = await session.execute(
+                    select(TaskRecord).where(TaskRecord.session_id == session_id)
+                )
+                chain_tasks = chain.scalars().all()
+                for task in chain_tasks:
+                    task.parent_task_id = root.task_id
+                    if root.jira_key and not task.jira_key:
+                        task.jira_key = root.jira_key
+                    updates.append(task)
+                updated += len(updates)
+
+            # Одиночные задачи без session_id — корень сами по себе
+            for task in orphans:
+                if not task.session_id:
+                    task.parent_task_id = task.task_id
+                    updated += 1
+
+            await session.commit()
+            if updated:
+                logger.info(f"Миграция данных: parent_task_id проставлен для {updated} задач")
     
     async def save_task(self, task_data: dict) -> TaskRecord:
         """Сохранить задачу"""
@@ -116,6 +182,54 @@ class Database:
             result = await session.execute(
                 select(TaskRecord)
                 .where(TaskRecord.user_id == user_id)
+                .order_by(TaskRecord.created_at.desc())
+                .limit(limit)
+            )
+            return result.scalars().all()
+
+    async def get_recent_resumable_tasks(self, user_id: int, limit: int = 10) -> List[TaskRecord]:
+        """
+        Последние задачи пользователя, доступные для продолжения диалога
+        (есть session_id). Дедупликация: на каждый диалог (parent_task_id или
+        jira_key) — только свежайшая запись; старые цепочки без parent_task_id
+        дедуплицируются по jira_key.
+        """
+        async with self.async_session() as session:
+            from sqlalchemy import select
+            result = await session.execute(
+                select(TaskRecord)
+                .where(
+                    TaskRecord.user_id == user_id,
+                    TaskRecord.session_id.isnot(None),
+                )
+                .order_by(TaskRecord.created_at.desc())
+                .limit(200)
+            )
+            tasks = result.scalars().all()
+
+        seen_dialogs: set = set()
+        selected: List[TaskRecord] = []
+        for task in tasks:  # от свежих к старым
+            key = task.parent_task_id or task.jira_key
+            if key:
+                if key in seen_dialogs:
+                    continue
+                seen_dialogs.add(key)
+            selected.append(task)
+            if len(selected) >= limit:
+                break
+        return selected
+
+    async def get_tasks_missing_jira_summary(self, limit: int = 20) -> List[TaskRecord]:
+        """Задачи с jira_key, у которых ещё не подтянуто название (jira_summary)."""
+        async with self.async_session() as session:
+            from sqlalchemy import select
+            result = await session.execute(
+                select(TaskRecord)
+                .where(
+                    TaskRecord.jira_key.isnot(None),
+                    TaskRecord.jira_summary.is_(None),
+                )
                 .order_by(TaskRecord.created_at.desc())
                 .limit(limit)
             )
