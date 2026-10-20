@@ -34,6 +34,8 @@ class TaskRecord(Base):
     jira_key = Column(String(20), nullable=True, index=True)  # ключ Jira-задачи (AA-123), если запрос относится к ней
     parent_task_id = Column(String(255), nullable=True, index=True)  # task_id корневой задачи диалога (для reply-продолжений)
     jira_summary = Column(String(255), nullable=True)  # название Jira-задачи (для отображения на кнопках меню)
+    model = Column(String(100), nullable=True)  # выбранная модель для этой сессии/задачи
+    endpoint = Column(String(100), nullable=True)  # выбранный эндпоинт для этой сессии/задачи
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
     
@@ -85,6 +87,12 @@ class Database:
             if "jira_summary" not in existing:
                 await conn.execute(text("ALTER TABLE tasks ADD COLUMN jira_summary VARCHAR(255)"))
                 logger.info("Миграция: добавлена колонка tasks.jira_summary")
+            if "model" not in existing:
+                await conn.execute(text("ALTER TABLE tasks ADD COLUMN model VARCHAR(100)"))
+                logger.info("Миграция: добавлена колонка tasks.model")
+            if "endpoint" not in existing:
+                await conn.execute(text("ALTER TABLE tasks ADD COLUMN endpoint VARCHAR(100)"))
+                logger.info("Миграция: добавлена колонка tasks.endpoint")
         await self._backfill_dialog_roots()
         logger.info("База данных инициализирована")
 
@@ -115,18 +123,19 @@ class Database:
                 # записи без jira_key) наследуют её parent_task_id и jira_key
                 root = min(group, key=lambda t: t.created_at)
                 updates = []
-                if session_id in {t.session_id for t in group}:
-                    # Вся цепочка: все задачи с этим session_id, не только сироты
-                    pass
-                chain = await session.execute(
-                    select(TaskRecord).where(TaskRecord.session_id == session_id)
-                )
-                chain_tasks = chain.scalars().all()
-                for task in chain_tasks:
-                    task.parent_task_id = root.task_id
-                    if root.jira_key and not task.jira_key:
-                        task.jira_key = root.jira_key
-                    updates.append(task)
+            chain = await session.execute(
+                select(TaskRecord).where(TaskRecord.session_id == session_id)
+            )
+            chain_tasks = chain.scalars().all()
+            for task in chain_tasks:
+                task.parent_task_id = root.task_id
+                if root.jira_key and not task.jira_key:
+                    task.jira_key = root.jira_key
+                if root.model and not task.model:
+                    task.model = root.model
+                if root.endpoint and not task.endpoint:
+                    task.endpoint = root.endpoint
+                updates.append(task)
                 updated += len(updates)
 
             # Одиночные задачи без session_id — корень сами по себе

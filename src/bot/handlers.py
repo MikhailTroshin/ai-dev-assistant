@@ -50,6 +50,16 @@ class ProjectStates(StatesGroup):
     waiting_for_project = State()
 
 
+class ModelStates(StatesGroup):
+    """Состояния для выбора модели"""
+    waiting_for_model = State()
+
+
+class EndpointStates(StatesGroup):
+    """Состояния для выбора эндпоинта"""
+    waiting_for_endpoint = State()
+
+
 class ContextStates(StatesGroup):
     """Состояния флоу добавления контекста к задаче"""
     waiting_for_context = State()
@@ -81,6 +91,8 @@ BUTTON_ALIASES: dict[str, str] = {
     "🔎 Детали задачи": "task_details",
     "📊 Статус": "status",
     "🗂 Сменить проект": "project",
+    "🤖 Модель": "model",
+    "🔌 Эндпоинт": "endpoint",
 }
 
 
@@ -94,11 +106,9 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="❓ Вопрос"), KeyboardButton(text="📋 Задача Jira")],
             [KeyboardButton(text="🐛 Баг"), KeyboardButton(text="🔍 Code Review")],
             [KeyboardButton(text="🔧 Rebase"), KeyboardButton(text="↩️ Продолжить работу")],
-            [KeyboardButton(text="🗂 Сменить проект"), KeyboardButton(text="📜 История")],
-            [
-                KeyboardButton(text="📈 Статистика"),
-                KeyboardButton(text="📊 Статус"),
-            ],
+            [KeyboardButton(text="🗂 Сменить проект"), KeyboardButton(text="🤖 Модель")],
+            [KeyboardButton(text="🔌 Эндпоинт"), KeyboardButton(text="📜 История")],
+            [KeyboardButton(text="📈 Статистика"), KeyboardButton(text="📊 Статус")],
             [KeyboardButton(text="🔎 Детали задачи")],
         ],
         resize_keyboard=True,
@@ -321,6 +331,54 @@ async def set_user_project(user_id: int, project: str) -> None:
         await redis_client.close()
 
 
+async def get_user_model(user_id: int) -> str | None:
+    """Активная модель пользователя (хранится в Redis), иначе дефолтная."""
+    redis_client = redis.from_url(
+        f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}"
+    )
+    try:
+        model = await redis_client.get(f"user_model:{user_id}")
+        if model:
+            return model.decode("utf-8")
+    finally:
+        await redis_client.close()
+    return getattr(settings, "DEFAULT_MODEL", None)
+
+
+async def set_user_model(user_id: int, model: str) -> None:
+    redis_client = redis.from_url(
+        f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}"
+    )
+    try:
+        await redis_client.set(f"user_model:{user_id}", model)
+    finally:
+        await redis_client.close()
+
+
+async def get_user_endpoint(user_id: int) -> str | None:
+    """Активный эндпоинт пользователя."""
+    redis_client = redis.from_url(
+        f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}"
+    )
+    try:
+        ep = await redis_client.get(f"user_endpoint:{user_id}")
+        if ep:
+            return ep.decode("utf-8")
+    finally:
+        await redis_client.close()
+    return getattr(settings, "DEFAULT_ENDPOINT", "default")
+
+
+async def set_user_endpoint(user_id: int, endpoint: str) -> None:
+    redis_client = redis.from_url(
+        f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}"
+    )
+    try:
+        await redis_client.set(f"user_endpoint:{user_id}", endpoint)
+    finally:
+        await redis_client.close()
+
+
 async def _submit_prompt(
     message: Message,
     command: str,
@@ -330,6 +388,8 @@ async def _submit_prompt(
     project: str = None,
     jira_key: str = None,
     parent_task_id: str = None,
+    model: str = None,
+    endpoint: str = None,
 ):
     """Постановка задачи в очередь с готовым промптом (общая для всех команд)."""
     redis_pool = redis_pool or _RedisPoolHolder.pool
@@ -337,15 +397,38 @@ async def _submit_prompt(
     chat_id = message.chat.id
     task_id = f"{command}_{user_id}_{message.message_id}"
     project = project or await get_user_project(user_id)
+    # Модель: для нового диалога берём из выбора пользователя, для продолжения диалога (reply)
+    # стараемся использовать модель корневой задачи, чтобы сохранить контекст работы с ней
+    root_task = None
+    if resume_session_id and parent_task_id:
+        try:
+            root_task = await db.get_task(parent_task_id)
+        except Exception:
+            root_task = None
+
+    if model is None:
+        if root_task and root_task.model:
+            model = root_task.model
+        else:
+            model = await get_user_model(user_id)
+
+    if endpoint is None:
+        if root_task and root_task.endpoint:
+            endpoint = root_task.endpoint
+        else:
+            endpoint = await get_user_endpoint(user_id)
+
     # Идентификатор Jira-задачи: явный (унаследованный от диалога) или из промпта
     jira_key = jira_key or extract_jira_key(prompt)
 
     key_note = f"\n🔖 Jira: `{jira_key}`" if jira_key else ""
     reply_note = "\n💬 Продолжение диалога" if resume_session_id else ""
+    model_note = f"\n🤖 Модель: `{model}`" if model else ""
+    ep_note = f"\n🔌 Эндпоинт: `{endpoint}`" if endpoint else ""
     await message.answer(
         f"⏳ Задача принята!\n"
         f"ID: `{task_id}`\n"
-        f"🗂 Проект: `{project}`{key_note}{reply_note}\n\n"
+        f"🗂 Проект: `{project}`{key_note}{reply_note}{model_note}{ep_note}\n\n"
         f"Сообщу, когда будет готово (может занять до 10 минут)",
         parse_mode="Markdown",
     )
@@ -362,6 +445,8 @@ async def _submit_prompt(
         resume_session_id=resume_session_id,
         jira_key=jira_key,
         parent_task_id=parent_task_id,
+        model=model,
+        endpoint=endpoint,
     )
 
     await save_task_mapping(task_id, chat_id, user_id)
@@ -443,6 +528,10 @@ async def handle_button(message: Message, state: FSMContext):
         await _enter_details(message, state)
     elif command == "project":
         await _enter_project(message, state)
+    elif command == "model":
+        await _enter_model(message, state)
+    elif command == "endpoint":
+        await _enter_endpoint(message, state)
     elif command == "continue":
         await show_continue_menu(message)
     elif command == "history":
@@ -1047,6 +1136,178 @@ async def process_project_text(message: Message, state: FSMContext):
         parse_mode="Markdown",
         reply_markup=get_main_keyboard(),
     )
+
+
+# ==================== /model (выбор модели) ====================
+
+CB_MODEL_PREFIX = "model:select:"
+
+
+def get_model_keyboard_inline() -> InlineKeyboardMarkup:
+    """Inline-клавиатура выбора модели из настроек."""
+    buttons = []
+    for m in getattr(settings, "AVAILABLE_MODELS", []):
+        model_id = m.get("id") if isinstance(m, dict) else str(m)
+        model_name = m.get("name") if isinstance(m, dict) else model_id
+        buttons.append([InlineKeyboardButton(text=model_name, callback_data=CB_MODEL_PREFIX + model_id)])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def _enter_model(message: Message, state: FSMContext):
+    """Начало флоу выбора модели."""
+    current = await get_user_model(message.from_user.id)
+    await state.set_state(ModelStates.waiting_for_model)
+    models_list = []
+    for m in getattr(settings, "AVAILABLE_MODELS", []):
+        model_id = m.get("id") if isinstance(m, dict) else str(m)
+        model_name = m.get("name") if isinstance(m, dict) else model_id
+        models_list.append(f"  • `{model_id}` — {model_name}")
+    models_text = "\n".join(models_list) if models_list else "  (не настроены)"
+    await message.answer(
+        f"🤖 Текущая модель: `{current or 'default'}`\n\n"
+        f"Доступные модели:\n{models_text}\n\n"
+        f"Выбери модель кнопкой ниже 👇",
+        parse_mode="Markdown",
+        reply_markup=get_model_keyboard_inline(),
+    )
+
+
+@router.message(Command("model"))
+async def cmd_model(message: Message, state: FSMContext):
+    """Выбор модели. Поддерживает inline-аргумент (/model glm-5.3)."""
+    inline = _command_args(message.text)
+    if inline:
+        model_id = inline.strip()
+        available = []
+        for m in getattr(settings, "AVAILABLE_MODELS", []):
+            mid = m.get("id") if isinstance(m, dict) else str(m)
+            available.append(mid)
+        if model_id in available or model_id:
+            await state.clear()
+            await set_user_model(message.from_user.id, model_id)
+            await message.answer(f"✅ Модель выбрана: `{model_id}`", parse_mode="Markdown", reply_markup=get_main_keyboard())
+            return
+    await _enter_model(message, state)
+
+
+@router.callback_query(F.data.startswith(CB_MODEL_PREFIX))
+async def cb_model_select(callback: CallbackQuery, state: FSMContext):
+    """Выбор модели по inline-кнопке."""
+    await callback.answer()
+    model_id = callback.data[len(CB_MODEL_PREFIX):]
+    await state.clear()
+    await set_user_model(callback.from_user.id, model_id)
+    await callback.message.answer(
+        f"✅ Модель выбрана: `{model_id}`\n"
+        f"🤖 Все новые задачи будут выполняться с этой моделью.\n"
+        f"💬 Продолжение диалога будет использовать модель исходной сессии.",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard(),
+    )
+
+
+@router.message(ModelStates.waiting_for_model, F.text)
+async def process_model_text(message: Message, state: FSMContext):
+    """Выбор модели текстом."""
+    model_id = (message.text or "").strip()
+    available = []
+    for m in getattr(settings, "AVAILABLE_MODELS", []):
+        mid = m.get("id") if isinstance(m, dict) else str(m)
+        available.append(mid)
+    if available and model_id not in available:
+        await message.answer(
+            "❌ Модель не найдена. Выбери кнопкой:",
+            reply_markup=get_model_keyboard_inline(),
+        )
+        return
+    await state.clear()
+    await set_user_model(message.from_user.id, model_id)
+    await message.answer(
+        f"✅ Модель выбрана: `{model_id}`",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard(),
+    )
+
+
+# ==================== /endpoint (выбор эндпоинта) ====================
+
+CB_ENDPOINT_PREFIX = "endpoint:select:"
+
+
+def get_endpoint_keyboard_inline() -> InlineKeyboardMarkup:
+    """Inline-клавиатура выбора эндпоинта."""
+    buttons = []
+    for name, cfg in getattr(settings, "ENDPOINTS", {}).items():
+        label = cfg.name if hasattr(cfg, "name") else name
+        buttons.append([InlineKeyboardButton(text=f"{label} ({name})", callback_data=CB_ENDPOINT_PREFIX + name)])
+    if not buttons:
+        buttons.append([InlineKeyboardButton(text="default", callback_data=CB_ENDPOINT_PREFIX + "default")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def _enter_endpoint(message: Message, state: FSMContext):
+    """Начало флоу выбора эндпоинта."""
+    current = await get_user_endpoint(message.from_user.id)
+    await state.set_state(EndpointStates.waiting_for_endpoint)
+    lines = []
+    for name, cfg in getattr(settings, "ENDPOINTS", {}).items():
+        label = cfg.name if hasattr(cfg, "name") else name
+        base = getattr(cfg, "base_url", "")
+        lines.append(f"  • `{name}` — {label}\n    `{base}`")
+    text_lines = "\n".join(lines) if lines else "  (не настроены)"
+    await message.answer(
+        f"🔌 Текущий эндпоинт: `{current or 'default'}`\n\n"
+        f"Доступные эндпоинты:\n{text_lines}\n\n"
+        f"Выбери эндпоинт кнопкой ниже 👇",
+        parse_mode="Markdown",
+        reply_markup=get_endpoint_keyboard_inline(),
+    )
+
+
+@router.message(Command("endpoint"))
+async def cmd_endpoint(message: Message, state: FSMContext):
+    """Выбор эндпоинта."""
+    inline = _command_args(message.text)
+    if inline and inline.strip() in (getattr(settings, "ENDPOINTS", {}).keys() or {"default"}):
+        ep = inline.strip()
+        await state.clear()
+        await set_user_endpoint(message.from_user.id, ep)
+        await message.answer(f"✅ Эндпоинт выбран: `{ep}`", parse_mode="Markdown", reply_markup=get_main_keyboard())
+        return
+    await _enter_endpoint(message, state)
+
+
+@router.callback_query(F.data.startswith(CB_ENDPOINT_PREFIX))
+async def cb_endpoint_select(callback: CallbackQuery, state: FSMContext):
+    """Выбор эндпоинта по кнопке."""
+    await callback.answer()
+    ep = callback.data[len(CB_ENDPOINT_PREFIX):]
+    await state.clear()
+    await set_user_endpoint(callback.from_user.id, ep)
+    await callback.message.answer(
+        f"✅ Эндпоинт выбран: `{ep}`\n"
+        f"🔌 Все новые задачи будут выполняться через этот эндпоинт.",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard(),
+    )
+
+
+@router.message(EndpointStates.waiting_for_endpoint, F.text)
+async def process_endpoint_text(message: Message, state: FSMContext):
+    """Выбор эндпоинта текстом."""
+    name_ep = (message.text or "").strip()
+    available = list(getattr(settings, "ENDPOINTS", {}).keys())
+    if not available:
+        available = ["default"]
+    if name_ep not in available:
+        await message.answer(
+            "❌ Эндпоинт не найден. Выбери кнопкой:",
+            reply_markup=get_endpoint_keyboard_inline(),
+        )
+        return
+    await state.clear()
+    await set_user_endpoint(message.from_user.id, name_ep)
+    await message.answer(f"✅ Эндпоинт выбран: `{name_ep}`", parse_mode="Markdown", reply_markup=get_main_keyboard())
 
 
 # ==================== Мониторинг и статистика ====================

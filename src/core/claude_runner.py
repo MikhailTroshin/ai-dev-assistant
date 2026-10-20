@@ -53,6 +53,8 @@ class ClaudeRunner:
         working_dir: Optional[Path] = None,
         timeout: Optional[int] = None,
         resume_session_id: Optional[str] = None,
+        model: Optional[str] = None,
+        endpoint: Optional[str] = None,
     ) -> dict:
         """
         Запускает Claude Code с промптом.
@@ -76,26 +78,46 @@ class ClaudeRunner:
         """
         timeout = timeout or settings.CLAUDE_TIMEOUT
         started = time.monotonic()
+        model = model or getattr(settings, "DEFAULT_MODEL", None)
+        endpoint_name = endpoint or getattr(settings, "DEFAULT_ENDPOINT", "default")
 
         log_lines = [
             f"=== Claude Code run ===",
             f"cmd: {self.claude_path}",
             f"cwd: {working_dir}",
             f"timeout: {timeout}s",
+            f"model: {model or '-'}",
+            f"endpoint: {endpoint_name}",
             f"resume_session: {resume_session_id or '-'}",
             f"prompt ({len(prompt)} chars): {prompt[:500]}{'...' if len(prompt) > 500 else ''}",
         ]
 
         try:
             cmd = [self.claude_path, prompt, "--output-format", "json"]
+            if model:
+                cmd += ["--model", model]
             if resume_session_id:
                 cmd += ["--resume", resume_session_id]
+
+            # Собираем env с возможной переопределённой конфигурацией эндпоинта
+            env = os.environ.copy()
+            ep_cfg = None
+            if hasattr(settings, "ENDPOINTS") and endpoint_name in settings.ENDPOINTS:
+                ep_cfg = settings.ENDPOINTS[endpoint_name]
+                if ep_cfg.base_url:
+                    env["ANTHROPIC_BASE_URL"] = ep_cfg.base_url
+                if ep_cfg.auth_token:
+                    env["ANTHROPIC_AUTH_TOKEN"] = ep_cfg.auth_token
+                if ep_cfg.extra_env:
+                    env.update(ep_cfg.extra_env)
+                log_lines.append(f"endpoint_base_url: {ep_cfg.base_url}")
 
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=working_dir,
+                env=env,
                 # Отдельная группа процессов: позволяет убить всё дерево
                 # (включая дочерние процессы Claude Code) при таймауте
                 start_new_session=True,

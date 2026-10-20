@@ -28,6 +28,17 @@ class ProjectConfig(BaseModel):
         return self.venv / "bin" / "python"
 
 
+class EndpointConfig(BaseModel):
+    """Конфигурация API эндпоинта."""
+    name: str
+    base_url: str
+    auth_token: Optional[str] = None
+    # Модели, доступные через этот эндпоинт
+    models: list[dict] = Field(default_factory=list)
+    # Доп. env переменные при запуске Claude
+    extra_env: dict[str, str] = Field(default_factory=dict)
+
+
 class Settings(BaseSettings):
     # Redis
     REDIS_HOST: str = "localhost"
@@ -37,6 +48,23 @@ class Settings(BaseSettings):
     # Paths
     PROJECT_PATH: Path = Path("/home/ws/mtroshin/ai_assistant")
     ML_REPO_PATH: Path = Path("/home/ws/mtroshin/ragllm")
+
+    # Эндпоинты (для переключения между провайдерами/прокси)
+    ENDPOINTS: dict[str, EndpointConfig] = Field(
+        default={
+            "default": EndpointConfig(
+                name="Default (LiteLLM)",
+                base_url="http://10.105.0.22:4000",
+                auth_token="sk-vaqxNEJeop61Np15ljn3Tw",
+                models=[
+                    {"id": "glm-4.7", "name": "GLM-4.7"},
+                    {"id": "glm-5.2", "name": "GLM-5.2"},
+                    {"id": "glm-5.3", "name": "GLM-5.3"},
+                ],
+            ),
+        }
+    )
+    DEFAULT_ENDPOINT: str = "default"
 
     # Реестр проектов продукта (мульти-репо)
     PROJECTS: dict[str, ProjectConfig] = Field(
@@ -84,6 +112,15 @@ class Settings(BaseSettings):
     
     # Claude Code
     CLAUDE_CODE_PATH: str = "claude"
+    # Доступные модели для переключения (в рамках текущего эндпоинта)
+    AVAILABLE_MODELS: list[dict] = Field(
+        default=[
+            {"id": "glm-4.7", "name": "GLM-4.7"},
+            {"id": "glm-5.2", "name": "GLM-5.2 (default)"},
+            {"id": "glm-5.3", "name": "GLM-5.3"},
+        ]
+    )
+    DEFAULT_MODEL: str = "glm-5.2"
     # Таймаут по умолчанию для одной задачи Claude Code (сек)
     CLAUDE_TIMEOUT: int = 600  # 10 минут
     # Таймауты по командам (сек). Разработка/ревью больших MR идут долго,

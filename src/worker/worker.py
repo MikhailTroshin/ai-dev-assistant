@@ -120,6 +120,8 @@ async def process_task(
     resume_session_id: Optional[str] = None,
     jira_key: Optional[str] = None,
     parent_task_id: Optional[str] = None,
+    model: Optional[str] = None,
+    endpoint: Optional[str] = None,
 ) -> dict:
     """
     Обработчик задач из очереди.
@@ -172,6 +174,8 @@ async def process_task(
         "project": project,
         "jira_key": jira_key,
         "parent_task_id": parent_task_id,
+        "model": model,
+        "endpoint": endpoint,
         "created_at": start_time
     })
 
@@ -181,7 +185,7 @@ async def process_task(
 
     # Запускаем Claude Code. Любая ошибка (включая отмену от arq) попадает
     # в _save_failure — пользователь получит уведомление в ТГ, а не тишину.
-    logger.info(f"Запускаем Claude Code в {work_dir} (timeout={claude_timeout}s"
+    logger.info(f"Запускаем Claude Code в {work_dir} (timeout={claude_timeout}s, model={model or 'default'}, endpoint={endpoint or 'default'}"
                 f"{f', resume={resume_session_id[:8]}…' if resume_session_id else ''})...")
     try:
         result = await claude_runner.run(
@@ -189,6 +193,8 @@ async def process_task(
             working_dir=work_dir,
             timeout=claude_timeout,
             resume_session_id=resume_session_id,
+            model=model,
+            endpoint=endpoint,
         )
     except asyncio.CancelledError:
         # Джобу отменил arq (job_timeout) или воркер останавливается.
