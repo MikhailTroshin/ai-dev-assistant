@@ -49,13 +49,20 @@ class Settings(BaseSettings):
     PROJECT_PATH: Path = Path("/home/ws/mtroshin/ai_assistant")
     ML_REPO_PATH: Path = Path("/home/ws/mtroshin/ragllm")
 
-    # Эндпоинты (для переключения между провайдерами/прокси)
+    # Файл с реестром эндпоинтов/моделей (перечитывается на лету, без рестарта).
+    # Относительный путь ищется от cwd (в боте это /app, у воркера — корень проекта).
+    # Именно этот файл — источник правды; ENDPOINTS ниже используется только как
+    # заготовка при создании файла, если его ещё нет.
+    ENDPOINTS_FILE: str = "data/endpoints.json"
+
+    # Эндпоинты по умолчанию (используются для первичного создания ENDPOINTS_FILE).
+    # Токен здесь НЕ храним: если в файле auth_token не задан, берётся токен из
+    # пользовательских настроек Claude Code (~/.claude/settings.json).
     ENDPOINTS: dict[str, EndpointConfig] = Field(
         default={
             "default": EndpointConfig(
                 name="Default (LiteLLM)",
                 base_url="http://10.105.0.22:4000",
-                auth_token="sk-vaqxNEJeop61Np15ljn3Tw",
                 models=[
                     {"id": "glm-4.7", "name": "GLM-4.7"},
                     {"id": "glm-5.2", "name": "GLM-5.2"},

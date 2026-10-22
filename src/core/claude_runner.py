@@ -1,15 +1,21 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
 import signal
 import time
 from pathlib import Path
 from typing import Optional
 
 from config.settings import settings
+from src.core.endpoints import Endpoint, endpoints_registry
 
 logger = logging.getLogger(__name__)
+
+# Пользовательские настройки Claude Code (env с токеном/эндпоинтом и permissions)
+USER_CLAUDE_SETTINGS = Path(os.path.expanduser("~/.claude/settings.json"))
 
 
 class _OutputCollector:
@@ -47,6 +53,63 @@ class ClaudeRunner:
     def __init__(self, claude_path: str = None):
         self.claude_path = claude_path or settings.CLAUDE_CODE_PATH
 
+    @staticmethod
+    def _build_endpoint_settings_file(endpoint: Endpoint) -> Optional[Path]:
+        """
+        Готовит файл настроек Claude Code под конкретный эндпоинт.
+
+        Claude Code применяет env из ~/.claude/settings.json поверх переменных
+        окружения процесса, поэтому переопределить базовый URL/токен можно
+        только через `--settings` (у него выше приоритет). Берём пользовательские
+        настройки как базу, подменяем env эндпоинта и сохраняем рядом с реестром.
+
+        Возвращает путь к файлу или None, если подготовить не удалось.
+        """
+        try:
+            base: dict = {}
+            if USER_CLAUDE_SETTINGS.exists():
+                try:
+                    base = json.loads(USER_CLAUDE_SETTINGS.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError) as e:
+                    logger.warning(f"Не удалось прочитать {USER_CLAUDE_SETTINGS}: {e}")
+
+            env: dict[str, str] = dict(base.get("env") or {})
+            if endpoint.base_url:
+                env["ANTHROPIC_BASE_URL"] = endpoint.base_url
+            if endpoint.auth_token:
+                env["ANTHROPIC_AUTH_TOKEN"] = endpoint.auth_token
+            env.update(endpoint.extra_env or {})
+
+            merged = {k: v for k, v in base.items() if k != "mcpServers"}
+            merged["env"] = env
+
+            payload = json.dumps(merged, ensure_ascii=False, sort_keys=True, indent=2)
+            digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+            safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", endpoint.id) or "endpoint"
+
+            cache_dir = endpoints_registry.path.parent / ".endpoint_settings"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            safe_dir = cache_dir / safe_id
+            safe_dir.mkdir(parents=True, exist_ok=True)
+
+            target = safe_dir / f"{digest}.json"
+            if not target.exists():
+                tmp = safe_dir / f".{digest}.tmp"
+                tmp.write_text(payload, encoding="utf-8")
+                os.chmod(tmp, 0o600)
+                tmp.replace(target)
+                # Удаляем устаревшие версии настроек этого эндпоинта
+                for old in safe_dir.glob("*.json"):
+                    if old != target:
+                        try:
+                            old.unlink()
+                        except OSError:
+                            pass
+            return target
+        except OSError as e:
+            logger.error(f"Не удалось подготовить настройки эндпоинта {endpoint.id}: {e}")
+            return None
+
     async def run(
         self,
         prompt: str,
@@ -79,7 +142,7 @@ class ClaudeRunner:
         timeout = timeout or settings.CLAUDE_TIMEOUT
         started = time.monotonic()
         model = model or getattr(settings, "DEFAULT_MODEL", None)
-        endpoint_name = endpoint or getattr(settings, "DEFAULT_ENDPOINT", "default")
+        endpoint_name = endpoint or endpoints_registry.default_endpoint()
 
         log_lines = [
             f"=== Claude Code run ===",
@@ -99,18 +162,28 @@ class ClaudeRunner:
             if resume_session_id:
                 cmd += ["--resume", resume_session_id]
 
-            # Собираем env с возможной переопределённой конфигурацией эндпоинта
+            # Эндпоинт берём из реестра на каждый запуск — поэтому правки в
+            # data/endpoints.json подхватываются без рестарта.
+            ep_cfg = endpoints_registry.get(endpoint_name)
+            if ep_cfg is None:
+                log_lines.append(
+                    f"endpoint '{endpoint_name}' не найден в реестре — используются настройки по умолчанию"
+                )
             env = os.environ.copy()
-            ep_cfg = None
-            if hasattr(settings, "ENDPOINTS") and endpoint_name in settings.ENDPOINTS:
-                ep_cfg = settings.ENDPOINTS[endpoint_name]
+            settings_file = None
+            if ep_cfg:
+                log_lines.append(f"endpoint_base_url: {ep_cfg.base_url or '(из settings.json)'}")
+                settings_file = self._build_endpoint_settings_file(ep_cfg)
+                if settings_file:
+                    cmd += ["--settings", str(settings_file)]
+                    log_lines.append(f"settings_file: {settings_file}")
+                # env тоже выставляем: полезно для дочерних процессов
                 if ep_cfg.base_url:
                     env["ANTHROPIC_BASE_URL"] = ep_cfg.base_url
                 if ep_cfg.auth_token:
                     env["ANTHROPIC_AUTH_TOKEN"] = ep_cfg.auth_token
                 if ep_cfg.extra_env:
                     env.update(ep_cfg.extra_env)
-                log_lines.append(f"endpoint_base_url: {ep_cfg.base_url}")
 
             process = await asyncio.create_subprocess_exec(
                 *cmd,

@@ -26,6 +26,10 @@ data/*.db
 data/*.sqlite3
 nohup.out
 
+# Реестр эндпоинтов содержит токены — в git только шаблон
+data/endpoints.json
+data/.endpoint_settings/
+
 # Docker
 .docker/
 

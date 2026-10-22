@@ -1,0 +1,31 @@
+{
+  "_comment": "Шаблон реестра эндпоинтов. Скопируйте в data/endpoints.json и правьте его на лету — перезапуск не нужен.",
+  "default_endpoint": "default",
+  "default_model": "glm-5.2",
+  "endpoints": {
+    "default": {
+      "name": "Default (LiteLLM)",
+      "base_url": "http://10.105.0.22:4000",
+      "auth_token": "",
+      "models": [
+        {"id": "glm-5.3", "name": "GLM-5.3"},
+        {"id": "glm-5.3-flash", "name": "GLM-5.3 Flash"},
+        {"id": "glm-5.2", "name": "GLM-5.2"},
+        {"id": "glm-5.1", "name": "GLM-5.1"},
+        {"id": "glm-4.7", "name": "GLM-4.7"}
+      ],
+      "extra_env": {}
+    },
+    "free": {
+      "name": "Free models (пример)",
+      "base_url": "https://example-free-proxy/anthropic",
+      "auth_token": "sk-free-token",
+      "models": [
+        {"id": "nemotron", "name": "Nemotron"},
+        {"id": "big-pickle", "name": "Big Pickle"},
+        {"id": "glm-5.3-free", "name": "GLM-5.3 Free"}
+      ],
+      "extra_env": {}
+    }
+  }
+}

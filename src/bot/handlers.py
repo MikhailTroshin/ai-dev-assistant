@@ -10,6 +10,7 @@ from aiogram.fsm.state import State, StatesGroup
 import redis.asyncio as redis
 
 from src.core.database import db
+from src.core.endpoints import endpoints_registry
 from src.core.jira_key import extract_jira_key
 from config.settings import settings, get_project_path, get_default_project
 
@@ -342,7 +343,7 @@ async def get_user_model(user_id: int) -> str | None:
             return model.decode("utf-8")
     finally:
         await redis_client.close()
-    return getattr(settings, "DEFAULT_MODEL", None)
+    return endpoints_registry.default_model()
 
 
 async def set_user_model(user_id: int, model: str) -> None:
@@ -356,17 +357,25 @@ async def set_user_model(user_id: int, model: str) -> None:
 
 
 async def get_user_endpoint(user_id: int) -> str | None:
-    """Активный эндпоинт пользователя."""
+    """
+    Активный эндпоинт пользователя.
+
+    Если сохранённый эндпоинт исчез из реестра (файл отредактировали), плавно
+    возвращаемся к эндпоинту по умолчанию.
+    """
     redis_client = redis.from_url(
         f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}"
     )
     try:
         ep = await redis_client.get(f"user_endpoint:{user_id}")
         if ep:
-            return ep.decode("utf-8")
+            ep = ep.decode("utf-8")
+            if endpoints_registry.get(ep):
+                return ep
+            logger.warning(f"Эндпоинт '{ep}' больше не в реестре — использую дефолтный")
     finally:
         await redis_client.close()
-    return getattr(settings, "DEFAULT_ENDPOINT", "default")
+    return endpoints_registry.default_endpoint()
 
 
 async def set_user_endpoint(user_id: int, endpoint: str) -> None:
@@ -1143,32 +1152,38 @@ async def process_project_text(message: Message, state: FSMContext):
 CB_MODEL_PREFIX = "model:select:"
 
 
-def get_model_keyboard_inline() -> InlineKeyboardMarkup:
-    """Inline-клавиатура выбора модели из настроек."""
-    buttons = []
-    for m in getattr(settings, "AVAILABLE_MODELS", []):
-        model_id = m.get("id") if isinstance(m, dict) else str(m)
-        model_name = m.get("name") if isinstance(m, dict) else model_id
-        buttons.append([InlineKeyboardButton(text=model_name, callback_data=CB_MODEL_PREFIX + model_id)])
+def _models_for_user(endpoint_id: str) -> list[dict]:
+    """Модели, доступные на выбранном эндпоинте (из реестра, с горячей перезагрузкой)."""
+    return endpoints_registry.models(endpoint_id)
+
+
+def get_model_keyboard_inline(endpoint_id: str | None = None) -> InlineKeyboardMarkup:
+    """Inline-клавиатура выбора модели для эндпоинта."""
+    endpoint_id = endpoint_id or endpoints_registry.default_endpoint()
+    buttons = [
+        [InlineKeyboardButton(text=m["name"], callback_data=CB_MODEL_PREFIX + m["id"])]
+        for m in _models_for_user(endpoint_id)
+    ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 async def _enter_model(message: Message, state: FSMContext):
-    """Начало флоу выбора модели."""
+    """Начало флоу выбора модели (модели текущего эндпоинта)."""
     current = await get_user_model(message.from_user.id)
+    endpoint_id = await get_user_endpoint(message.from_user.id) or endpoints_registry.default_endpoint()
     await state.set_state(ModelStates.waiting_for_model)
-    models_list = []
-    for m in getattr(settings, "AVAILABLE_MODELS", []):
-        model_id = m.get("id") if isinstance(m, dict) else str(m)
-        model_name = m.get("name") if isinstance(m, dict) else model_id
-        models_list.append(f"  • `{model_id}` — {model_name}")
+    models = _models_for_user(endpoint_id)
+    models_list = [f"  • `{m['id']}` — {m['name']}" for m in models]
     models_text = "\n".join(models_list) if models_list else "  (не настроены)"
+    endpoint = endpoints_registry.get(endpoint_id)
+    ep_label = endpoint.name if endpoint else endpoint_id
     await message.answer(
-        f"🤖 Текущая модель: `{current or 'default'}`\n\n"
+        f"🤖 Текущая модель: `{current or 'default'}`\n"
+        f"🔌 Эндпоинт: `{endpoint_id}` ({ep_label})\n\n"
         f"Доступные модели:\n{models_text}\n\n"
         f"Выбери модель кнопкой ниже 👇",
         parse_mode="Markdown",
-        reply_markup=get_model_keyboard_inline(),
+        reply_markup=get_model_keyboard_inline(endpoint_id),
     )
 
 
@@ -1178,15 +1193,10 @@ async def cmd_model(message: Message, state: FSMContext):
     inline = _command_args(message.text)
     if inline:
         model_id = inline.strip()
-        available = []
-        for m in getattr(settings, "AVAILABLE_MODELS", []):
-            mid = m.get("id") if isinstance(m, dict) else str(m)
-            available.append(mid)
-        if model_id in available or model_id:
-            await state.clear()
-            await set_user_model(message.from_user.id, model_id)
-            await message.answer(f"✅ Модель выбрана: `{model_id}`", parse_mode="Markdown", reply_markup=get_main_keyboard())
-            return
+        await state.clear()
+        await set_user_model(message.from_user.id, model_id)
+        await message.answer(f"✅ Модель выбрана: `{model_id}`", parse_mode="Markdown", reply_markup=get_main_keyboard())
+        return
     await _enter_model(message, state)
 
 
@@ -1210,14 +1220,12 @@ async def cb_model_select(callback: CallbackQuery, state: FSMContext):
 async def process_model_text(message: Message, state: FSMContext):
     """Выбор модели текстом."""
     model_id = (message.text or "").strip()
-    available = []
-    for m in getattr(settings, "AVAILABLE_MODELS", []):
-        mid = m.get("id") if isinstance(m, dict) else str(m)
-        available.append(mid)
+    endpoint_id = await get_user_endpoint(message.from_user.id) or endpoints_registry.default_endpoint()
+    available = [m["id"] for m in _models_for_user(endpoint_id)]
     if available and model_id not in available:
         await message.answer(
             "❌ Модель не найдена. Выбери кнопкой:",
-            reply_markup=get_model_keyboard_inline(),
+            reply_markup=get_model_keyboard_inline(endpoint_id),
         )
         return
     await state.clear()
@@ -1235,11 +1243,11 @@ CB_ENDPOINT_PREFIX = "endpoint:select:"
 
 
 def get_endpoint_keyboard_inline() -> InlineKeyboardMarkup:
-    """Inline-клавиатура выбора эндпоинта."""
-    buttons = []
-    for name, cfg in getattr(settings, "ENDPOINTS", {}).items():
-        label = cfg.name if hasattr(cfg, "name") else name
-        buttons.append([InlineKeyboardButton(text=f"{label} ({name})", callback_data=CB_ENDPOINT_PREFIX + name)])
+    """Inline-клавиатура выбора эндпоинта (из реестра, с горячей перезагрузкой)."""
+    buttons = [
+        [InlineKeyboardButton(text=f"{ep.name} ({ep.id})", callback_data=CB_ENDPOINT_PREFIX + ep.id)]
+        for ep in endpoints_registry.endpoints().values()
+    ]
     if not buttons:
         buttons.append([InlineKeyboardButton(text="default", callback_data=CB_ENDPOINT_PREFIX + "default")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1249,11 +1257,10 @@ async def _enter_endpoint(message: Message, state: FSMContext):
     """Начало флоу выбора эндпоинта."""
     current = await get_user_endpoint(message.from_user.id)
     await state.set_state(EndpointStates.waiting_for_endpoint)
-    lines = []
-    for name, cfg in getattr(settings, "ENDPOINTS", {}).items():
-        label = cfg.name if hasattr(cfg, "name") else name
-        base = getattr(cfg, "base_url", "")
-        lines.append(f"  • `{name}` — {label}\n    `{base}`")
+    lines = [
+        f"  • `{ep.id}` — {ep.name}\n    `{ep.base_url or '(из settings.json)'}`"
+        for ep in endpoints_registry.endpoints().values()
+    ]
     text_lines = "\n".join(lines) if lines else "  (не настроены)"
     await message.answer(
         f"🔌 Текущий эндпоинт: `{current or 'default'}`\n\n"
@@ -1264,15 +1271,39 @@ async def _enter_endpoint(message: Message, state: FSMContext):
     )
 
 
+async def _apply_endpoint_choice(user_id: int, endpoint_id: str) -> tuple[str, str | None]:
+    """
+    Сохраняет выбранный эндпоинт и приводит модель в соответствие с ним.
+
+    Returns:
+        (endpoint_id, model) — выбранная модель (None, если у эндпоинта нет списка).
+    """
+    await set_user_endpoint(user_id, endpoint_id)
+    models = endpoints_registry.models(endpoint_id)
+    model_ids = [m["id"] for m in models]
+    current_model = await get_user_model(user_id)
+    if model_ids and current_model not in model_ids:
+        # Текущая модель недоступна на этом эндпоинте — берём первую доступную
+        await set_user_model(user_id, model_ids[0])
+        return endpoint_id, model_ids[0]
+    return endpoint_id, current_model
+
+
 @router.message(Command("endpoint"))
 async def cmd_endpoint(message: Message, state: FSMContext):
     """Выбор эндпоинта."""
     inline = _command_args(message.text)
-    if inline and inline.strip() in (getattr(settings, "ENDPOINTS", {}).keys() or {"default"}):
+    available = list(endpoints_registry.endpoints().keys())
+    if inline and inline.strip() in available:
         ep = inline.strip()
         await state.clear()
-        await set_user_endpoint(message.from_user.id, ep)
-        await message.answer(f"✅ Эндпоинт выбран: `{ep}`", parse_mode="Markdown", reply_markup=get_main_keyboard())
+        _, model = await _apply_endpoint_choice(message.from_user.id, ep)
+        model_note = f"\n🤖 Модель: `{model}`" if model else ""
+        await message.answer(
+            f"✅ Эндпоинт выбран: `{ep}`{model_note}",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard(),
+        )
         return
     await _enter_endpoint(message, state)
 
@@ -1282,10 +1313,14 @@ async def cb_endpoint_select(callback: CallbackQuery, state: FSMContext):
     """Выбор эндпоинта по кнопке."""
     await callback.answer()
     ep = callback.data[len(CB_ENDPOINT_PREFIX):]
+    if not endpoints_registry.get(ep):
+        await callback.message.answer(f"❌ Эндпоинт `{ep}` не найден в реестре.")
+        return
     await state.clear()
-    await set_user_endpoint(callback.from_user.id, ep)
+    _, model = await _apply_endpoint_choice(callback.from_user.id, ep)
+    model_note = f"\n🤖 Модель: `{model}`" if model else ""
     await callback.message.answer(
-        f"✅ Эндпоинт выбран: `{ep}`\n"
+        f"✅ Эндпоинт выбран: `{ep}`{model_note}\n"
         f"🔌 Все новые задачи будут выполняться через этот эндпоинт.",
         parse_mode="Markdown",
         reply_markup=get_main_keyboard(),
@@ -1296,18 +1331,20 @@ async def cb_endpoint_select(callback: CallbackQuery, state: FSMContext):
 async def process_endpoint_text(message: Message, state: FSMContext):
     """Выбор эндпоинта текстом."""
     name_ep = (message.text or "").strip()
-    available = list(getattr(settings, "ENDPOINTS", {}).keys())
-    if not available:
-        available = ["default"]
-    if name_ep not in available:
+    if not endpoints_registry.get(name_ep):
         await message.answer(
             "❌ Эндпоинт не найден. Выбери кнопкой:",
             reply_markup=get_endpoint_keyboard_inline(),
         )
         return
     await state.clear()
-    await set_user_endpoint(message.from_user.id, name_ep)
-    await message.answer(f"✅ Эндпоинт выбран: `{name_ep}`", parse_mode="Markdown", reply_markup=get_main_keyboard())
+    _, model = await _apply_endpoint_choice(message.from_user.id, name_ep)
+    model_note = f"\n🤖 Модель: `{model}`" if model else ""
+    await message.answer(
+        f"✅ Эндпоинт выбран: `{name_ep}`{model_note}",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard(),
+    )
 
 
 # ==================== Мониторинг и статистика ====================
